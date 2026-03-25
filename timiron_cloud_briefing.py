@@ -86,7 +86,6 @@ def search_emails(search_query, top=5):
         "$search": f'"{search_query}"',
         "$top": top,
         "$select": "id,subject,from,body,receivedDateTime,hasAttachments",
-        "$orderby": "receivedDateTime desc",
     }
     r = requests.get(url, headers=graph_headers(), params=params, timeout=30)
     if not r.ok:
