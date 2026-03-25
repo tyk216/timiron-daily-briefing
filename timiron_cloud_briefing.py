@@ -58,7 +58,7 @@ def get_access_token():
         "client_id":     MS_GRAPH_CLIENT_ID,
         "grant_type":    "refresh_token",
         "refresh_token": MS_GRAPH_REFRESH_TOKEN,
-        "scope":         "https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.ReadWrite offline_access",
+        "scope":         "Mail.Read Files.Read.All offline_access",
     }, timeout=30)
     if not r.ok:
         print(f"  Token refresh failed: {r.status_code} {r.text[:300]}")
