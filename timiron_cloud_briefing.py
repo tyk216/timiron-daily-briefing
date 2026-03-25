@@ -2,15 +2,20 @@
 timiron_cloud_briefing.py — Cloud version of Timiron Daily Briefing
 Runs on GitHub Actions at 6 AM ET daily.
 Uses Microsoft Graph API directly for Outlook email search and attachments.
-Sends HTML briefing email via Gmail SMTP.
+Sends dark-themed HTML briefing email via Gmail SMTP with TWO Excel attachments.
+
+Output is identical to the local script (timiron_daily_update.py).
 """
 
-import os, json, re, sys, smtplib, base64, io
+import os, json, re, sys, shutil, smtplib, base64, io, tempfile
 from datetime import date, timedelta, datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 import requests
 import pandas as pd
+import openpyxl
 
 # ════════════════════════════════════════════════════════════════════════════
 # CONFIG — from GitHub Secrets (environment variables)
@@ -22,6 +27,10 @@ GMAIL_ADDRESS          = os.environ.get('GMAIL_ADDRESS', 'tyk216@gmail.com')
 GMAIL_APP_PASS         = os.environ.get('GMAIL_APP_PASS', '')
 RECIPIENTS             = os.environ.get('RECIPIENTS', 'tylerk@timironmp.com,robk@timirontrading.com').split(',')
 
+# Templates live in ./templates/ directory in the repo
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE_DIR = os.path.join(SCRIPT_DIR, "templates")
+
 CARRIER_AVGS = {
     'Badlands':          224.6,
     'KAG':               188.9,
@@ -30,13 +39,16 @@ CARRIER_AVGS = {
     '1st Choice Energy': 183.3,
 }
 
-MARCH_DAYS       = 31
-RAIL_CAP_DAILY   = 15000
-MARCH_FIXED_COST = 244583.52
+# ════════════════════════════════════════════════════════════════════════════
+# CONSTANTS — copied from local script
+# ════════════════════════════════════════════════════════════════════════════
 
-FEB_AVG_DAILY    = 11200
-FEB_TOTAL_BBLS   = 313600
-FEB_AVG_UTE      = 43.9
+MARCH_DAYS        = 31
+RAIL_CAP_DAILY    = 15000
+MARCH_FIXED_COST  = 244583.52
+PUMP_HRS_MONTH    = 744
+YTD_BBLS_PRE_MAR   = 2520947 - 329633
+YTD_TRUCKS_PRE_MAR = 13218 - 2039
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 TOKEN_URL  = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
@@ -115,7 +127,7 @@ def get_body_text(msg):
     return content.strip()
 
 # ════════════════════════════════════════════════════════════════════════════
-# STEP 1: Fetch Cadiz Ops data via Graph API (Outlook search)
+# FETCH CADIZ OPS DATA — via Graph API (Outlook search)
 # ════════════════════════════════════════════════════════════════════════════
 
 def fetch_cadiz_ops():
@@ -127,14 +139,12 @@ def fetch_cadiz_ops():
 
     result = {
         "date": yesterday_str,
-        "switch_start": "N/A",
-        "switch_end": "N/A",
+        "switch_start": None,
+        "switch_end": None,
         "loaded_cars_out": 0,
         "empty_cars_in": 0,
         "maintenance_notes": [],
         "carrier_projections": {},
-        "yesterday_bbls_from_logs": None,
-        "yesterday_trucks_from_logs": None,
     }
 
     # --- RAIL SWAP email ---
@@ -144,7 +154,6 @@ def fetch_cadiz_ops():
         subj = msg.get("subject", "")
         if today_str in subj or yesterday_str in subj:
             body = get_body_text(msg)
-            # Parse: START TIME 3:05 AM
             start_m = re.search(r'START\s+TIME\s+(\d{1,2}:\d{2}\s*[AP]M)', body, re.IGNORECASE)
             end_m = re.search(r'END\s+TIME\s+(\d{1,2}:\d{2}\s*[AP]M)', body, re.IGNORECASE)
             loaded_m = re.search(r'(\d+)\s+LOADED\s+CARS?\s+SENT', body, re.IGNORECASE)
@@ -166,7 +175,6 @@ def fetch_cadiz_ops():
     for msg in msgs:
         subj = msg.get("subject", "")
         if today_str in subj or yesterday_str in subj:
-            # Subject: "03.25.26 4:48 AM UPDATE"
             time_m = re.search(r'(\d{1,2}:\d{2}\s*[AP]M)\s+UPDATE', subj, re.IGNORECASE)
             if time_m:
                 result["switch_end"] = time_m.group(1).strip()
@@ -174,21 +182,6 @@ def fetch_cadiz_ops():
             body = get_body_text(msg)
             if body.strip():
                 result["maintenance_notes"].append(body.strip()[:200])
-            break
-
-    # --- LOGS email (yesterday's BBLs and trucks) ---
-    print("  Searching for LOGS email...")
-    msgs = search_emails(f"from:cadiz.ops subject:LOGS")
-    for msg in msgs:
-        subj = msg.get("subject", "")
-        if today_str in subj or yesterday_str in subj:
-            body = get_body_text(msg)
-            # Parse: "59 TRUCKS - 11,474.24 BBLS"
-            logs_m = re.search(r'(\d+)\s+TRUCKS?\s*[-\u2013]\s*([\d,]+\.?\d*)\s+BBLS?', body, re.IGNORECASE)
-            if logs_m:
-                result["yesterday_trucks_from_logs"] = int(logs_m.group(1))
-                result["yesterday_bbls_from_logs"] = float(logs_m.group(2).replace(',', ''))
-                print(f"    LOGS: {result['yesterday_trucks_from_logs']} trucks, {result['yesterday_bbls_from_logs']} BBLs")
             break
 
     # --- Carrier projections ---
@@ -204,10 +197,8 @@ def fetch_cadiz_ops():
         for msg in msgs:
             subj = msg.get("subject", "")
             recv = msg.get("receivedDateTime", "")
-            # Only today's messages
             if today.strftime('%Y-%m-%d') in recv[:10]:
                 body = get_body_text(msg)
-                # Look for truck count: "We have 9 planned so far"
                 truck_m = re.search(r'(\d+)\s+(?:planned|trucks?|loads?|scheduled)', body, re.IGNORECASE)
                 if not truck_m:
                     truck_m = re.search(r'(?:have|running|sending|doing)\s+(\d+)', body, re.IGNORECASE)
@@ -234,22 +225,19 @@ def fetch_cadiz_ops():
     return result
 
 # ════════════════════════════════════════════════════════════════════════════
-# STEP 2: Fetch Master Load Log Excel from Rob's email attachment
+# FETCH MASTER LOAD LOG — download Excel from Rob's email attachment
 # ════════════════════════════════════════════════════════════════════════════
 
-def fetch_load_log_data(cadiz_data=None):
-    """Find Rob's Master Load Log email, download Excel, parse with pandas."""
-    yesterday = date.today() - timedelta(days=1)
-    yesterday_str = yesterday.strftime('%m.%d.%y')
-
+def fetch_load_log_excel():
+    """Find Rob's Master Load Log email, download Excel attachment.
+    Returns (excel_bytes, excel_filename) or (None, None).
+    """
     print("  Searching for Master Load Log email from Rob...")
     msgs = search_emails("from:robk subject:Master Load Log")
 
-    excel_bytes = None
     for msg in msgs:
         if not msg.get("hasAttachments"):
             continue
-        # Get the most recent one
         attachments = get_attachments(msg["id"])
         for att in attachments:
             name = att.get("name", "")
@@ -258,429 +246,454 @@ def fetch_load_log_data(cadiz_data=None):
                 if content_bytes:
                     excel_bytes = base64.b64decode(content_bytes)
                     print(f"    Found attachment: {name} ({len(excel_bytes):,} bytes)")
-                    break
-        if excel_bytes:
-            break
+                    return excel_bytes, name
+    print("  ERROR: Could not find Master Load Log Excel attachment")
+    return None, None
 
-    if not excel_bytes:
-        print("  ERROR: Could not find Master Load Log Excel attachment")
-        return None
+# ════════════════════════════════════════════════════════════════════════════
+# PARSE LOAD LOG — copied from local script (identical logic)
+# ════════════════════════════════════════════════════════════════════════════
 
-    # Parse with pandas
-    return parse_load_log(excel_bytes, cadiz_data)
+def parse_load_log(excel_bytes):
+    """Parse the Master Load Log Excel from bytes. Returns dict matching local script output."""
+    df = pd.read_excel(io.BytesIO(excel_bytes), sheet_name='Master_Load_Log', header=0)
+    df['Date']       = pd.to_datetime(df['Date']).dt.date
+    df['BOL_prefix'] = df['Timiron BOL#'].astype(str).str[:3]
+    df['Metered']    = pd.to_numeric(df['Timiron Metered bbls.'], errors='coerce').fillna(0)
 
-def parse_load_log(excel_bytes, cadiz_data=None):
-    """Parse the Master Load Log Excel file."""
-    yesterday = date.today() - timedelta(days=1)
-    yesterday_str = yesterday.strftime('%m.%d.%y')
+    def to_mins(t):
+        try: s=str(t); p=s.split(':'); return int(p[0])*60+int(p[1])
+        except: return 0
 
-    try:
-        df = pd.read_excel(io.BytesIO(excel_bytes), sheet_name='Master_Load_Log')
-    except Exception as e:
-        print(f"  ERROR reading Excel sheet 'Master_Load_Log': {e}")
-        # Try first sheet as fallback
-        try:
-            df = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=0)
-            print("  Falling back to first sheet")
-        except Exception as e2:
-            print(f"  ERROR reading any sheet: {e2}")
-            return None
+    df['pump_mins'] = df['Pump Time'].apply(to_mins)
+    march = df[df['Date'] >= date(2026,3,1)].copy()
+    if march.empty: raise ValueError("No March 2026 data in load log.")
 
-    print(f"  Loaded {len(df)} rows from Excel")
+    # Use yesterday's date (load log is always dated yesterday)
+    yesterday_date = date.today() - timedelta(days=1)
 
-    # Normalize column names
-    df.columns = [str(c).strip() for c in df.columns]
+    # MTD = all days up to and including yesterday
+    mtd_data = march[march['Date'] <= yesterday_date]
 
-    # Find relevant columns
-    date_col = None
-    bol_col = None
-    bbls_col = None
-    pump_time_col = None
-    split_col = None
+    yday_count = len(march[march['Date'] == yesterday_date])
+    print(f"  Yesterday: {yesterday_date}  ({yday_count} loads)")
+    mtd_days = sorted(mtd_data['Date'].unique())
+    print(f"  MTD: {len(mtd_days)} days  ({min(mtd_days)} -- {max(mtd_days)})")
 
-    for c in df.columns:
-        cl = c.lower()
-        if 'date' in cl and date_col is None:
-            date_col = c
-        elif 'bol' in cl and bol_col is None:
-            bol_col = c
-        elif 'metered' in cl and 'bbl' in cl and bbls_col is None:
-            bbls_col = c
-        elif 'pump' in cl and 'time' in cl and pump_time_col is None:
-            pump_time_col = c
-        elif 'split' in cl and split_col is None:
-            split_col = c
-
-    print(f"  Columns mapped: date={date_col}, bol={bol_col}, bbls={bbls_col}, pump_time={pump_time_col}, split={split_col}")
-
-    if not all([date_col, bol_col, bbls_col]):
-        print("  ERROR: Could not find required columns")
-        return None
-
-    # Filter to March 2026 data
-    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-    march_start = datetime(2026, 3, 1)
-    march_end = datetime(2026, 3, 31, 23, 59, 59)
-    df_march = df[(df[date_col] >= march_start) & (df[date_col] <= march_end)].copy()
-    print(f"  March 2026 rows: {len(df_march)}")
-
-    if len(df_march) == 0:
-        print("  ERROR: No March 2026 data found")
-        return None
-
-    # Determine pump from BOL prefix
-    def get_pump(bol):
-        s = str(bol).strip()
-        if s.startswith('111'):
-            return 'P-101'
-        elif s.startswith('222'):
-            return 'P-102'
-        elif s.startswith('333'):
-            return 'P-103'
-        return None
-
-    df_march['pump'] = df_march[bol_col].apply(get_pump)
-
-    # Identify split loads
-    def is_split2(val):
-        if pd.isna(val):
-            return False
-        return 'split #2' in str(val).lower() or 'split#2' in str(val).lower().replace(' ', '')
-
-    if split_col:
-        df_march['is_split2'] = df_march[split_col].apply(is_split2)
-    else:
-        df_march['is_split2'] = False
-
-    # Parse pump time to hours
-    def parse_pump_time(val):
-        if pd.isna(val):
-            return 0.0
-        s = str(val).strip()
-        m = re.match(r'(\d+):(\d{2})', s)
-        if m:
-            return int(m.group(1)) + int(m.group(2)) / 60.0
-        try:
-            return float(s)
-        except:
-            return 0.0
-
-    if pump_time_col:
-        df_march['pump_hrs'] = df_march[pump_time_col].apply(parse_pump_time)
-    else:
-        df_march['pump_hrs'] = 0.0
-
-    df_march['bbls_val'] = pd.to_numeric(df_march[bbls_col], errors='coerce').fillna(0)
-
-    # --- Yesterday's data ---
-    yesterday_dt = pd.Timestamp(yesterday)
-    df_yday = df_march[df_march[date_col].dt.date == yesterday]
-    yday_bbls = df_yday['bbls_val'].sum()
-    yday_trucks = len(df_yday[~df_yday['is_split2']])
-
-    # Use LOGS email data if available and Excel data seems off
-    if cadiz_data and cadiz_data.get('yesterday_bbls_from_logs'):
-        logs_bbls = cadiz_data['yesterday_bbls_from_logs']
-        logs_trucks = cadiz_data['yesterday_trucks_from_logs']
-        if yday_bbls == 0 and logs_bbls > 0:
-            print(f"  Using LOGS email data for yesterday: {logs_bbls} BBLs, {logs_trucks} trucks")
-            yday_bbls = logs_bbls
-            yday_trucks = logs_trucks
-
-    # --- Pump utilization for yesterday ---
-    pumps = {}
-    for pname in ['P-101', 'P-102', 'P-103']:
-        df_pump = df_yday[df_yday['pump'] == pname]
-        loads = len(df_pump)
-        splits = len(df_pump[df_pump['is_split2']])
-        runtime = df_pump['pump_hrs'].sum()
-        bbls = df_pump['bbls_val'].sum()
-        ute = round(runtime / 21.0 * 100, 1) if runtime > 0 else 0
-        bhr = round(bbls / runtime) if runtime > 0 else 0
-        pumps[pname] = {
-            'loads': loads,
-            'splits': splits,
-            'runtime_hrs': round(runtime, 2),
-            'ute_pct': ute,
-            'bbls': round(bbls),
-            'bbls_hr': bhr,
+    yday = march[march['Date'] == yesterday_date]
+    pump_map = {'111':'P-101','222':'P-102','333':'P-103'}
+    pump_ute = {}
+    for prefix, pname in pump_map.items():
+        p         = yday[yday['BOL_prefix']==prefix]
+        splits    = p[p['Split Load'].astype(str).str.contains('Split #2',na=False)]
+        non_split = p[~p['Split Load'].astype(str).str.contains('Split #2',na=False)]
+        runtime   = p['pump_mins'].sum()/60
+        bbls      = p['Metered'].sum()
+        pump_ute[pname] = {
+            'loads':   len(non_split), 'splits': len(splits),
+            'runtime': round(runtime,2), 'ute': round(runtime/21*100,1),
+            'bbls':    round(bbls,2),
+            'bbl_hr':  round(bbls/runtime,0) if runtime>0 else 0
         }
+    combined_rt = sum(v['runtime'] for v in pump_ute.values())
 
-    # --- MTD data ---
-    unique_dates = sorted(df_march[date_col].dt.date.unique())
-    mtd_days = len(unique_dates)
-    mtd_total_bbls = df_march['bbls_val'].sum()
-    mtd_total_trucks = len(df_march[~df_march['is_split2']])
-    avg_bbls = round(mtd_total_bbls / mtd_days, 1) if mtd_days > 0 else 0
+    mtd_no_split = mtd_data[~mtd_data['Split Load'].astype(str).str.contains('Split #2',na=False)]
+    daily_trucks = mtd_no_split.groupby('Date').size()
+    daily_bbls   = mtd_data.groupby('Date')['Metered'].sum()
+    total_bbls   = daily_bbls.sum()
+    total_trucks = daily_trucks.sum()
+    days_actual  = len(daily_bbls)
+    days_remain  = MARCH_DAYS - days_actual
+    avg_bbls     = total_bbls / days_actual
+    avg_trucks   = total_trucks / days_actual
+    proj_bbls    = total_bbls + avg_bbls * days_remain
+    proj_trucks  = total_trucks + avg_trucks * days_remain
+    proj_rev     = rev_per_day(avg_bbls) * MARCH_DAYS
+    ebitda       = proj_rev - MARCH_FIXED_COST
+    rail_cap     = avg_bbls / RAIL_CAP_DAILY
+    p101 = mtd_data[mtd_data['BOL_prefix']=='111']['pump_mins'].sum()/60
+    p102 = mtd_data[mtd_data['BOL_prefix']=='222']['pump_mins'].sum()/60
+    p103 = mtd_data[mtd_data['BOL_prefix']=='333']['pump_mins'].sum()/60
 
-    # --- Daily data for weekly table ---
-    daily_data = []
-    for d in unique_dates:
-        df_day = df_march[df_march[date_col].dt.date == d]
-        d_bbls = df_day['bbls_val'].sum()
-        d_trucks = len(df_day[~df_day['is_split2']])
-        daily_data.append({
-            "date": d.strftime('%Y-%m-%d'),
-            "bbls": round(d_bbls, 2),
-            "trucks": d_trucks,
-        })
+    print(f"  MTD BBLs:  {total_bbls:,.2f}  avg {avg_bbls:,.1f}/day")
+    print(f"  Projected: {proj_bbls:,.0f} BBLs | {proj_trucks:,.0f} trucks")
+    print(f"  Pump Ute:  P-101 {pump_ute['P-101']['ute']}%  P-102 {pump_ute['P-102']['ute']}%  P-103 {pump_ute['P-103']['ute']}%  Combined {combined_rt/(21*3)*100:.1f}%")
 
-    result = {
-        "yesterday_date": yesterday_str,
-        "yesterday_bbls": round(yday_bbls, 2),
-        "yesterday_trucks": yday_trucks,
-        "mtd_days": mtd_days,
-        "mtd_total_bbls": round(mtd_total_bbls, 2),
-        "mtd_total_trucks": mtd_total_trucks,
-        "avg_bbls_per_day": avg_bbls,
-        "pump_utilization": pumps,
-        "daily_data": daily_data,
-    }
-
-    print(f"  Yesterday: {yday_bbls:,.2f} BBLs, {yday_trucks} trucks")
-    print(f"  MTD: {mtd_days} days, {mtd_total_bbls:,.2f} BBLs, avg {avg_bbls:,.1f}/day")
-    return result
+    return dict(
+        yesterday_date=yesterday_date, days_actual=days_actual, days_remain=days_remain,
+        total_bbls=round(total_bbls,2), total_trucks=int(total_trucks),
+        avg_bbls=round(avg_bbls,1), avg_trucks=round(avg_trucks,1),
+        proj_bbls=round(proj_bbls,0), proj_trucks=round(proj_trucks,0),
+        proj_rev=round(proj_rev,2), ebitda=round(ebitda,2),
+        rail_cap=round(rail_cap,6), pump_ute=pump_ute,
+        pump_ute_combined=round(combined_rt/(21*3),3),
+        p101_hrs=round(p101,2), p102_hrs=round(p102,2), p103_hrs=round(p103,2),
+    )
 
 # ════════════════════════════════════════════════════════════════════════════
-# STEP 3: Build HTML email
+# UPDATE EXCEL FILES — copied from local script (identical logic)
 # ════════════════════════════════════════════════════════════════════════════
 
-def build_briefing_html(load_data, cadiz_data):
-    """Build the full HTML briefing email."""
-    today = date.today()
-    yesterday = today - timedelta(days=1)
-    day_name = today.strftime('%A')
-    date_long = today.strftime('%B %d, %Y')
+def safe_write(ws, row, col, val):
+    cell = ws.cell(row, col)
+    if cell.__class__.__name__ != 'MergedCell':
+        cell.value = val
 
-    # Extract load log data
-    yday_bbls = load_data.get('yesterday_bbls', 0)
-    yday_trucks = load_data.get('yesterday_trucks', 0)
-    yday_bpt = round(yday_bbls / yday_trucks, 1) if yday_trucks > 0 else 0
-    mtd_days = load_data.get('mtd_days', 1)
-    mtd_bbls = load_data.get('mtd_total_bbls', 0)
-    mtd_trucks = load_data.get('mtd_total_trucks', 0)
-    avg_bbls = load_data.get('avg_bbls_per_day', 0)
-    days_remain = MARCH_DAYS - mtd_days
-    proj_bbls = mtd_bbls + avg_bbls * days_remain
-    proj_trucks = mtd_trucks + (mtd_trucks / mtd_days * days_remain) if mtd_days > 0 else 0
-    rail_cap = avg_bbls / RAIL_CAP_DAILY * 100 if RAIL_CAP_DAILY > 0 else 0
-    vs_rate = ((yday_bbls - avg_bbls) / avg_bbls * 100) if avg_bbls > 0 else 0
-    vs_feb = ((avg_bbls - FEB_AVG_DAILY) / FEB_AVG_DAILY * 100)
+def find_template(name_fragment):
+    """Find template in ./templates/ directory."""
+    exact = os.path.join(TEMPLATE_DIR, f"Timiron_{name_fragment}.xlsx")
+    if os.path.exists(exact):
+        print(f"  Template: Timiron_{name_fragment}.xlsx")
+        return exact
+    raise FileNotFoundError(
+        f"\nTemplate not found: Timiron_{name_fragment}.xlsx"
+        f"\nLooked in: {TEMPLATE_DIR}"
+    )
 
-    # Pump utilization
-    pumps = load_data.get('pump_utilization', {})
-    pump_rows = ""
-    total_rt = 0
-    total_loads = 0
-    total_splits = 0
-    total_bbls_pumps = 0
-    for pname in ['P-101', 'P-102', 'P-103']:
-        p = pumps.get(pname, {})
-        loads = p.get('loads', 0)
-        splits = p.get('splits', 0)
-        rt = p.get('runtime_hrs', 0)
-        ute = p.get('ute_pct', 0)
-        bbls = p.get('bbls', 0)
-        bhr = p.get('bbls_hr', 0)
-        total_rt += rt
-        total_loads += loads
-        total_splits += splits
-        total_bbls_pumps += bbls
-        pump_rows += f"<tr><td>{pname}</td><td>{loads}</td><td>{splits}</td><td>{rt} hrs</td><td>{ute}%</td><td>{bbls:,.0f}</td><td>{bhr:.0f}</td></tr>"
+def update_dashboard(template_path, d, output_path):
+    shutil.copy(template_path, output_path)
+    wb = openpyxl.load_workbook(output_path)
+    ws = wb['Operations Dashboard']
+    dt = d['yesterday_date'].strftime('%b %#d')
+    r  = 16
+    ws.cell(r, 3).value = d['proj_rev'];      ws.cell(r, 5).value = d['ebitda']
+    ws.cell(r, 6).value = d['ebitda'];        ws.cell(r, 7).value = d['proj_bbls']
+    ws.cell(r, 8).value = d['avg_bbls'];      ws.cell(r, 9).value = d['avg_trucks']
+    ws.cell(r,10).value = d['proj_trucks'];   ws.cell(r,11).value = round(d['proj_rev']/d['proj_bbls'],2)
+    ws.cell(r,12).value = round(MARCH_FIXED_COST/d['proj_bbls'],3)
+    ws.cell(r,13).value = round(d['ebitda']/d['proj_bbls'],3)
+    ws.cell(r,14).value = d['pump_ute_combined']; ws.cell(r,15).value = d['rail_cap']
+    ws.cell(3,1).value  = (f"Source: Actual P&Ls, Master Load Logs, Payroll Files, Trafigura Invoices  |  "
+                           f"Forecast: Mar 2026 based on {d['days_actual']}-day actuals (through {dt})  |  "
+                           f"Mar 2026 costs from Mar P&L Forecast tab")
+    ws.cell(18,1).value = (f"\u2020 Mar 2026 = FORECAST based on {d['days_actual']}-day actuals "
+                           f"({d['avg_bbls']:.1f} bbls/day avg) + steady run-rate through Mar 31. "
+                           f"Actuals through {dt} from daily Cadiz Ops LOGS emails. "
+                           "Dec 2025 cost is negative due to 71k payroll reversal.\n\n"
+                           "*  Adj Pump Util % = pump runtime hours \u00f7 true available hours (21 hrs/day).\n\n"
+                           "**  % of Rail Cap/Day = avg bbls/day \u00f7 15,000 bbl daily rail ceiling.")
+    pr = wb['Pump Runtime']
+    for r2 in range(1,20):
+        if pr.cell(r2,1).value and 'Mar 2026' in str(pr.cell(r2,1).value):
+            pr.cell(r2, 3).value=d['p101_hrs']; pr.cell(r2, 4).value=round(PUMP_HRS_MONTH-d['p101_hrs'],2); pr.cell(r2, 5).value=round(d['p101_hrs']/PUMP_HRS_MONTH,3)
+            pr.cell(r2, 6).value=d['p102_hrs']; pr.cell(r2, 7).value=round(PUMP_HRS_MONTH-d['p102_hrs'],2); pr.cell(r2, 8).value=round(d['p102_hrs']/PUMP_HRS_MONTH,3)
+            pr.cell(r2, 9).value=d['p103_hrs']; pr.cell(r2,10).value=round(PUMP_HRS_MONTH-d['p103_hrs'],2); pr.cell(r2,11).value=round(d['p103_hrs']/PUMP_HRS_MONTH,3)
+            pr.cell(r2,12).value=f"All 3 pumps active \u00b7 Partial month thru {dt}"; break
+    wb.save(output_path)
+    print(f"  Dashboard saved: {os.path.basename(output_path)}")
 
-    combined_ute = round(total_rt / (21 * 3) * 100, 1)
-    total_bhr = round(total_bbls_pumps / total_rt, 0) if total_rt > 0 else 0
-    pump_rows += f"<tr style='font-weight:bold;border-top:2px solid #333'><td>Combined</td><td>{total_loads}</td><td>{total_splits}</td><td>{total_rt:.2f} hrs</td><td>{combined_ute}%</td><td>{total_bbls_pumps:,.0f}</td><td>{total_bhr:.0f}</td></tr>"
+def update_external_report(template_path, d, output_path):
+    shutil.copy(template_path, output_path)
+    wb  = openpyxl.load_workbook(output_path)
+    bbt = round(d['avg_bbls']/d['avg_trucks'],1) if d['avg_trucks']>0 else 0
+    yb  = YTD_BBLS_PRE_MAR   + d['proj_bbls']
+    yt  = YTD_TRUCKS_PRE_MAR + d['proj_trucks']
+    dt  = d['yesterday_date'].strftime('%b %#d')
+    to  = wb['Terminal Overview']
+    safe_write(to,21, 3,d['proj_bbls']);      safe_write(to,21, 4,round(d['avg_bbls'],0))
+    safe_write(to,21, 5,d['proj_trucks']);    safe_write(to,21, 6,d['avg_trucks'])
+    safe_write(to,21, 7,bbt);                safe_write(to,21, 8,d['pump_ute_combined'])
+    safe_write(to,21, 9,d['rail_cap']);       safe_write(to,21,10,round(1-d['rail_cap'],3))
+    safe_write(to, 5, 1,round(yb,0));        safe_write(to, 5, 3,round(yt,0))
+    om  = wb['Operational Metrics']
+    safe_write(om,15, 3,d['p101_hrs']);  safe_write(om,15, 4,round(d['p101_hrs']/PUMP_HRS_MONTH,3))
+    safe_write(om,15, 5,d['p102_hrs']);  safe_write(om,15, 6,round(d['p102_hrs']/PUMP_HRS_MONTH,3))
+    safe_write(om,15, 7,d['p103_hrs']);  safe_write(om,15, 8,round(d['p103_hrs']/PUMP_HRS_MONTH,3))
+    safe_write(om,15, 9,round(d['p101_hrs']+d['p102_hrs']+d['p103_hrs'],1))
+    safe_write(om,15,10,d['pump_ute_combined'])
+    ca = wb['Capacity Analysis']
+    safe_write(ca,29,6,round(d['avg_trucks'],0)); safe_write(ca,29,7,round(d['avg_bbls'],0)); safe_write(ca,29,9,round(d['avg_bbls']*31,0))
+    kt = wb['Key Takeaways']
+    safe_write(kt,8,3, f"Feb 2026: 57.1 trucks/day, 11,200 bbls/day, 313,600 bbls for the month. "
+        f"Mar 2026 (through {dt}): {d['avg_trucks']:.1f} trucks/day, {d['avg_bbls']:.1f} bbls/day run rate, "
+        f"{d['proj_bbls']:,.0f} bbls projected. Total since April 2025: {yb:,.0f} bbls across {yt:,.0f} truck loads.")
+    wb.save(output_path)
+    print(f"  External report saved: {os.path.basename(output_path)}")
 
-    # Cadiz ops activity
-    switch_start = cadiz_data.get('switch_start', 'N/A') if cadiz_data else 'N/A'
-    switch_end = cadiz_data.get('switch_end', 'N/A') if cadiz_data else 'N/A'
-    carriers = cadiz_data.get('carrier_projections', {}) if cadiz_data else {}
+# ════════════════════════════════════════════════════════════════════════════
+# BUILD EMAIL HTML — copied from local script (identical output)
+# ════════════════════════════════════════════════════════════════════════════
 
-    carrier_rows = ""
-    total_carrier_trucks = 0
-    total_carrier_bbls = 0
-    for cname in ['Badlands', 'KAG', 'Prop Logistics', 'BD Oil', '1st Choice Energy']:
-        c = carriers.get(cname, {})
-        trucks = c.get('trucks', 0)
-        note = c.get('note', '')
-        if trucks > 0:
-            avg = CARRIER_AVGS.get(cname, 190)
-            proj = round(trucks * avg)
-            total_carrier_trucks += trucks
-            total_carrier_bbls += proj
-            carrier_rows += f"<tr><td>{cname}</td><td>{trucks}</td><td>{avg}</td><td>{proj:,}</td></tr>"
-        else:
-            carrier_rows += f"<tr><td>{cname}</td><td colspan='3' style='color:#999'>No response</td></tr>"
+def calc_switch_duration(start_str, end_str):
+    try:
+        fmt = '%I:%M%p'
+        s = datetime.strptime(start_str.upper().replace(' ',''), fmt)
+        e = datetime.strptime(end_str.upper().replace(' ',''), fmt)
+        diff = (e - s).seconds // 60
+        return (str(diff//60) + "hr " + str(diff%60) + "min") if diff >= 60 else (str(diff) + "min")
+    except:
+        return ""
 
-    carrier_rows += f"<tr style='font-weight:bold;border-top:2px solid #333'><td>Total</td><td>{total_carrier_trucks}</td><td>&mdash;</td><td>~{total_carrier_bbls:,} BBLs</td></tr>"
+def build_cadiz_section(switch_start, switch_end, loaded_out, empty_in, carrier_proj, maint_notes):
+    """Build the Cadiz Ops Activity + Carrier Projections HTML section."""
 
-    # Weekly data
-    daily_data = load_data.get('daily_data', [])
-    current_week_start = yesterday - timedelta(days=yesterday.weekday() + 2)  # Saturday
-    if current_week_start.weekday() != 5:
-        current_week_start -= timedelta(days=(current_week_start.weekday() + 2) % 7)
+    has_content = any([switch_start, carrier_proj, maint_notes])
+    if not has_content:
+        return ""
 
-    week_rows = ""
-    week_total_bbls = 0
-    week_total_trucks = 0
-    week_days = 0
-    for dd in daily_data:
-        try:
-            d_date = datetime.strptime(dd['date'], '%Y-%m-%d').date()
-            if d_date >= current_week_start and d_date <= yesterday:
-                day_abbr = d_date.strftime('%b %d (%a)')
-                d_bbls = dd.get('bbls', 0)
-                d_trucks = dd.get('trucks', 0)
-                d_bpt = round(d_bbls / d_trucks, 1) if d_trucks > 0 else 0
-                vs = ((d_bbls - avg_bbls) / avg_bbls * 100) if avg_bbls > 0 else 0
-                col = '#4caf50' if vs >= 0 else '#ef5350'
-                sign = '+' if vs >= 0 else ''
-                week_rows += f"<tr><td>{day_abbr}</td><td>{d_bbls:,.0f}</td><td>{d_trucks}</td><td>{d_bpt:.1f}</td><td style='color:{col}'>{sign}{vs:.1f}%</td></tr>"
-                week_total_bbls += d_bbls
-                week_total_trucks += d_trucks
-                week_days += 1
-        except:
-            continue
+    # Switch duration
+    duration_str = ""
+    if switch_start and switch_end:
+        duration_str = calc_switch_duration(switch_start, switch_end)
 
-    if week_days > 0:
-        week_avg_bpt = round(week_total_bbls / week_total_trucks, 1) if week_total_trucks > 0 else 0
-        week_vs = ((week_total_bbls / week_days - avg_bbls) / avg_bbls * 100) if avg_bbls > 0 else 0
-        col = '#4caf50' if week_vs >= 0 else '#ef5350'
-        sign = '+' if week_vs >= 0 else ''
-        week_rows += f"<tr style='font-weight:bold;border-top:2px solid #333'><td>{week_days}-Day Total</td><td>{week_total_bbls:,.0f}</td><td>{week_total_trucks}</td><td>{week_avg_bpt}</td><td style='color:{col}'>{sign}{week_vs:.1f}% avg</td></tr>"
+    switch_html = ""
+    if switch_start:
+        cars_str = ""
+        if loaded_out: cars_str += f" &nbsp;\u00b7&nbsp; {loaded_out} loaded out"
+        if empty_in:   cars_str += f" / {empty_in} empty in"
+        dur = f" &nbsp;\u00b7&nbsp; {duration_str}" if duration_str else ""
+        switch_html = f'<div class="kv"><span class="lbl">Rail Switch</span><span class="val">{switch_start} \u2192 {switch_end}{dur}{cars_str}</span></div>'
 
-    # Flags
+    # Maintenance notes
+    maint_html = ""
+    for note in maint_notes:
+        maint_html += f'<div class="kv"><span class="lbl">Maintenance</span><span class="val" style="color:#90caf9;">{note[:120]}</span></div>'
+
+    # Carrier projections table
+    carrier_html = ""
+    if carrier_proj:
+        all_carriers = ['Badlands','KAG','Prop Logistics','BD Oil','1st Choice Energy']
+        total_trucks = 0
+        total_bbls   = 0
+        rows = ""
+        for c in all_carriers:
+            if c in carrier_proj:
+                p = carrier_proj[c]
+                avg = CARRIER_AVGS.get(c, 190)
+                if p['trucks'] == 0:
+                    note = p.get('note','0 trucks')
+                    rows += f'<tr><td style="color:#555;">{c}</td><td style="color:#555;">0</td><td style="color:#555;">\u2014</td><td style="color:#555;font-style:italic;">{note}</td></tr>'
+                else:
+                    total_trucks += p['trucks']
+                    total_bbls   += p['proj_bbls']
+                    rows += f'<tr><td>{c}</td><td>{p["trucks"]}</td><td>{avg}</td><td>{p["proj_bbls"]:,}</td></tr>'
+            else:
+                rows += f'<tr><td style="color:#444;">{c}</td><td style="color:#444;" colspan="3" style="font-style:italic;">No response</td></tr>'
+
+        total_row = f'<tr class="tot"><td>Total</td><td>{total_trucks}</td><td>\u2014</td><td>~{total_bbls:,} BBLs</td></tr>'
+
+        carrier_html = f"""
+  <div class="sec-head" style="margin-top:10px;">\U0001f69b Carrier Projections</div>
+  <table>
+    <tr><th>Carrier</th><th>Trucks</th><th>Avg BBLs/Truck</th><th>Proj BBLs</th></tr>
+    {rows}
+    {total_row}
+  </table>"""
+
+    return f"""
+<div class="section">
+  <div class="sec-head">\U0001f4e1 Cadiz Ops Activity</div>
+  {switch_html}
+  {maint_html}
+  {carrier_html}
+</div>"""
+
+def build_email_html(d, dash_name, ext_name, cadiz_section=""):
+    pu        = d['pump_ute']
+    dt_str    = d['yesterday_date'].strftime('%B %#d, %Y')
+    today_str = date.today().strftime('%A, %B %#d, %Y')
+
+    yday_bbls   = sum(v['bbls']    for v in pu.values())
+    yday_trucks = sum(v['loads']   for v in pu.values())
+    yday_splits = sum(v['splits']  for v in pu.values())
+    yday_rt     = sum(v['runtime'] for v in pu.values())
+    combined_ute = yday_rt / (21*3) * 100 if yday_rt > 0 else 0
+    bbl_hr_comb  = yday_bbls / yday_rt if yday_rt > 0 else 0
+    bbl_per_truck = yday_bbls / yday_trucks if yday_trucks > 0 else 0
+
+    vs_run  = (yday_bbls - d['avg_bbls']) / d['avg_bbls'] * 100 if d['avg_bbls'] > 0 else 0
+    vs_feb  = d['proj_bbls'] - 313600
+    mtd_vs  = (d['avg_bbls'] - 11200) / 11200 * 100
+
+    def badge(val):
+        c = '#4caf50' if val >= 0 else '#ef5350'
+        s = '+' if val >= 0 else ''
+        return f'<span style="color:{c}">{s}{val:.1f}%</span>'
+
+    def badge_abs(val):
+        c = '#4caf50' if val >= 0 else '#ef5350'
+        s = '+' if val >= 0 else ''
+        return f'<span style="color:{c}">{s}{val:,.0f} BBLs</span>'
+
+    # ── Week 3 daily data ───────────────────────────────────────────────────
+    week3_dates = [
+        {'date': 'Mar 15 (Sat)', 'bbls': 8969.55,  'trucks': 45},
+        {'date': 'Mar 16 (Sun)', 'bbls': 9567.05,  'trucks': 48},
+        {'date': 'Mar 17 (Mon)', 'bbls': 9148.02,  'trucks': 45},
+        {'date': 'Mar 18 (Tue)', 'bbls': 10449.12, 'trucks': 52},
+        {'date': 'Mar 19 (Wed)', 'bbls': 8513.05,  'trucks': 43},
+        {'date': 'Mar 20 (Thu)', 'bbls': 10734.38, 'trucks': 54},
+        {'date': 'Mar 21 (Fri)', 'bbls': 11331.38, 'trucks': 56},
+    ]
+    week3_rows = ""
+    for row in week3_dates:
+        bpt  = row['bbls'] / row['trucks']
+        vs   = (row['bbls'] - d['avg_bbls']) / d['avg_bbls'] * 100
+        col  = '#4caf50' if vs >= 0 else '#ef5350'
+        sign = '+' if vs >= 0 else ''
+        week3_rows += f'<tr><td>{row["date"]}</td><td>{row["bbls"]:,.0f}</td><td>{row["trucks"]}</td><td>{bpt:.1f}</td><td style="color:{col}">{sign}{vs:.1f}%</td></tr>'
+
+    week3_total_bbls   = sum(r['bbls']   for r in week3_dates)
+    week3_total_trucks = sum(r['trucks'] for r in week3_dates)
+    week3_total_days   = len(week3_dates)
+    week3_bpt          = week3_total_bbls / week3_total_trucks
+    week3_avg_vs       = (week3_total_bbls/week3_total_days - d['avg_bbls']) / d['avg_bbls'] * 100
+
+    # ── Flags ────────────────────────────────────────────────────────────────
     flags = []
-    for pname in ['P-101', 'P-102', 'P-103']:
-        p = pumps.get(pname, {})
-        if p.get('ute_pct', 0) < 30:
-            others = [pumps.get(pn, {}).get('ute_pct', 0) for pn in ['P-101', 'P-102', 'P-103'] if pn != pname]
-            max_other = max(others) if others else 0
-            if max_other > 40:
-                flags.append(f"{pname} ute {p['ute_pct']}% vs {max_other}% &mdash; load imbalance across pumps.")
-        if p.get('bbls_hr', 0) > 0 and p.get('bbls_hr', 999) < 438:
-            flags.append(f"BBLs/hr below Feb avg (438): {pname} at {p['bbls_hr']:.0f}. Consistent with gap time between trucks.")
+    # Soft streak check
+    recent = week3_dates[-4:]
+    soft   = all((r['bbls'] - d['avg_bbls']) / d['avg_bbls'] * 100 < 5 for r in recent)
+    if soft:
+        flags.append(('red', f"Mar 17\u201320 all running below run rate \u2014 4+ soft days in a row. Monitor Trafigura dispatch."))
+    # Pump imbalance
+    utes = {k: v['ute'] for k, v in pu.items()}
+    max_p = max(utes, key=utes.get)
+    min_p = min(utes, key=utes.get)
+    if utes[max_p] - utes[min_p] > 10:
+        flags.append(('yellow', f"{min_p} ute {utes[min_p]}% vs {max_p} {utes[max_p]}% \u2014 load imbalance across pumps. {max_p} carrying disproportionate share."))
+    # BBLs/hr below avg
+    low_hr = [f"{k} at {v['bbl_hr']:.0f}" for k, v in pu.items() if v['bbl_hr'] > 0 and v['bbl_hr'] < 430]
+    if low_hr:
+        flags.append(('yellow', f"BBLs/hr below Feb avg (438): {', '.join(low_hr)}. Consistent with gap time between trucks."))
+    # Split count
+    split_pct = (yday_splits / yday_trucks * 100) if yday_trucks > 0 else 0
+    if split_pct <= 27:
+        flags.append(('grn', f"Split count {yday_splits}/{yday_trucks} ({split_pct:.1f}%) \u2014 near historical avg (24%). No railcar changeover surge."))
 
-    split_pct = round(total_splits / total_loads * 100, 1) if total_loads > 0 else 0
-    flags.append(f"Split count {total_splits}/{total_loads} ({split_pct}%) &mdash; {'near' if abs(split_pct - 24) < 5 else 'above' if split_pct > 24 else 'below'} historical avg (24%).")
+    flags_html = ""
+    for ftype, msg in flags:
+        if ftype == 'red':
+            flags_html += f'<div class="flag red">{msg}</div>'
+        elif ftype == 'grn':
+            flags_html += f'<div class="flag grn">{msg}</div>'
+        else:
+            flags_html += f'<div class="flag">{msg}</div>'
 
-    flags_html = "".join(f"<p style='margin:4px 0'>{f}</p>" for f in flags)
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<style>
+  body{{background:#1a1a1a;font-family:'Courier New',monospace;color:#e0e0e0;margin:0;padding:20px;}}
+  .wrap{{max-width:640px;margin:0 auto;}}
+  .title{{color:#fff;font-size:15px;font-weight:bold;border-bottom:1px solid #444;padding-bottom:8px;margin-bottom:6px;}}
+  .sub{{color:#666;font-size:11px;margin-bottom:18px;}}
+  .section{{background:#242424;border:1px solid #333;border-radius:3px;padding:13px 15px;margin-bottom:12px;}}
+  .sec-head{{color:#999;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:9px;border-bottom:1px solid #2e2e2e;padding-bottom:5px;}}
+  .kv{{display:flex;justify-content:space-between;padding:3px 0;font-size:13px;border-bottom:1px solid #2a2a2a;}}
+  .kv:last-child{{border-bottom:none;}}
+  .lbl{{color:#888;}}.val{{color:#ddd;font-weight:bold;}}
+  table{{width:100%;border-collapse:collapse;font-size:12px;margin-top:2px;}}
+  th{{color:#777;font-weight:normal;text-align:left;padding:4px 6px;border-bottom:1px solid #333;font-size:10px;}}
+  td{{padding:5px 6px;border-bottom:1px solid #2a2a2a;color:#ccc;}}
+  tr.tot td{{color:#fff;font-weight:bold;background:#2d2d2d;border-top:1px solid #444;}}
+  .flag{{padding:6px 10px;margin-bottom:6px;border-left:3px solid #FFD100;background:#2a2700;font-size:12px;border-radius:2px;}}
+  .flag.grn{{border-left-color:#4caf50;background:#162016;}}
+  .foot{{color:#444;font-size:10px;text-align:center;margin-top:14px;border-top:1px solid #2a2a2a;padding-top:10px;}}
+</style>
+</head><body><div class="wrap">
+<div class="title">\U0001f4ca Timiron Daily Briefing &nbsp;|&nbsp; Cadiz Terminal</div>
+<div class="sub">{today_str} &nbsp;\u00b7&nbsp; Based on {dt_str} LOGS</div>
 
-    vs_col = '#4caf50' if vs_rate >= 0 else '#ef5350'
-    vs_sign = '+' if vs_rate >= 0 else ''
-
-    html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><style>
-body {{ font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; max-width: 820px; margin: 0 auto; padding: 20px; color: #1a1a1a; background: #f8f9fa; }}
-h1 {{ font-size: 22px; border-bottom: 3px solid #1a5276; padding-bottom: 8px; }}
-h2 {{ font-size: 16px; color: #1a5276; margin-top: 24px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }}
-.kpi-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 12px 0; }}
-.kpi {{ background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; padding: 12px; text-align: center; }}
-.kpi-val {{ font-size: 22px; font-weight: bold; color: #1a5276; }}
-.kpi-label {{ font-size: 11px; color: #666; margin-top: 4px; }}
-table {{ width: 100%; border-collapse: collapse; font-size: 13px; background: #fff; margin: 8px 0; }}
-th {{ background: #1a5276; color: white; padding: 6px 10px; text-align: left; font-weight: 500; }}
-td {{ padding: 5px 10px; border-bottom: 1px solid #eee; }}
-tr:nth-child(even) {{ background: #f8f9fa; }}
-.flags {{ background: #fff8e1; border-left: 4px solid #ff9800; padding: 10px 14px; margin: 12px 0; font-size: 13px; }}
-.footer {{ font-size: 11px; color: #999; margin-top: 30px; padding-top: 10px; border-top: 1px solid #ddd; }}
-</style></head><body>
-
-<h1>&#x1F4CA; Timiron Daily Briefing | Cadiz Terminal</h1>
-<p style="color:#666;margin-top:-8px">{day_name}, {date_long} &middot; Based on {yesterday.strftime('%B %d, %Y')} LOGS</p>
-
-<h2>&#x1F4C5; Yesterday &mdash; {yesterday.strftime('%B %d, %Y')}</h2>
-<div class="kpi-grid">
-  <div class="kpi"><div class="kpi-val">{yday_bbls:,.2f}</div><div class="kpi-label">BBLs</div></div>
-  <div class="kpi"><div class="kpi-val">{yday_trucks}</div><div class="kpi-label">Trucks</div></div>
-  <div class="kpi"><div class="kpi-val">{yday_bpt}</div><div class="kpi-label">Avg BBLs / Truck</div></div>
-  <div class="kpi"><div class="kpi-val" style="color:{vs_col}">{vs_sign}{vs_rate:.1f}%</div><div class="kpi-label">vs Run Rate Avg</div></div>
+<div class="section">
+  <div class="sec-head">\U0001f4c5 Yesterday \u2014 {dt_str}</div>
+  <div class="kv"><span class="lbl">BBLs</span><span class="val">{yday_bbls:,.2f}</span></div>
+  <div class="kv"><span class="lbl">Trucks</span><span class="val">{yday_trucks}</span></div>
+  <div class="kv"><span class="lbl">Avg BBLs / Truck</span><span class="val">{bbl_per_truck:.1f}</span></div>
+  <div class="kv"><span class="lbl">vs Run Rate Avg</span><span class="val">{badge(vs_run)} &nbsp;({yday_bbls:,.0f} vs {d['avg_bbls']:,.0f} avg)</span></div>
 </div>
 
-<h2>&#x2699;&#xFE0F; Pump Utilization &mdash; {yesterday.strftime('%B %d, %Y')}</h2>
-<table>
-<tr><th>Pump</th><th>Loads</th><th>Splits</th><th>Runtime</th><th>Ute %</th><th>BBLs</th><th>BBLs/Hr</th></tr>
-{pump_rows}
-</table>
-<p style="font-size:11px;color:#888">Ute % = runtime / 21 true available hrs/pump (24hr - 3hr rail switch) &middot; Feb 2026 avg: {FEB_AVG_UTE}%</p>
-
-<h2>&#x1F4C6; Month-to-Date (Mar 1&ndash;{yesterday.day})</h2>
-<div class="kpi-grid">
-  <div class="kpi"><div class="kpi-val">{mtd_bbls:,.0f}</div><div class="kpi-label">MTD BBLs</div></div>
-  <div class="kpi"><div class="kpi-val">{avg_bbls:,.1f}</div><div class="kpi-label">Daily Avg ({mtd_days} days)</div></div>
-  <div class="kpi"><div class="kpi-val" style="color:{'#4caf50' if vs_feb >= 0 else '#ef5350'}">{'+' if vs_feb >= 0 else ''}{vs_feb:.1f}%</div><div class="kpi-label">vs Feb Avg ({FEB_AVG_DAILY:,}/day)</div></div>
-  <div class="kpi"><div class="kpi-val">{rail_cap:.1f}%</div><div class="kpi-label">% of Rail Cap (15k/day)</div></div>
+<div class="section">
+  <div class="sec-head">\u2699\ufe0f Pump Ute \u2014 {dt_str} &nbsp;<span style="color:#555;font-size:10px;">(actual start/end times \u00b7 splits = first start \u2192 last end)</span></div>
+  <table>
+    <tr><th>Pump</th><th>Loads</th><th>Splits</th><th>Runtime</th><th>Ute %</th><th>BBLs</th><th>BBLs/Hr</th></tr>
+    <tr><td>P-101</td><td>{pu['P-101']['loads']}</td><td>{pu['P-101']['splits']}</td><td>{pu['P-101']['runtime']} hrs</td><td>{pu['P-101']['ute']}%</td><td>{pu['P-101']['bbls']:,.0f}</td><td>{pu['P-101']['bbl_hr']:.0f}</td></tr>
+    <tr><td>P-102</td><td>{pu['P-102']['loads']}</td><td>{pu['P-102']['splits']}</td><td>{pu['P-102']['runtime']} hrs</td><td>{pu['P-102']['ute']}%</td><td>{pu['P-102']['bbls']:,.0f}</td><td>{pu['P-102']['bbl_hr']:.0f}</td></tr>
+    <tr><td>P-103</td><td>{pu['P-103']['loads']}</td><td>{pu['P-103']['splits']}</td><td>{pu['P-103']['runtime']} hrs</td><td>{pu['P-103']['ute']}%</td><td>{pu['P-103']['bbls']:,.0f}</td><td>{pu['P-103']['bbl_hr']:.0f}</td></tr>
+    <tr class="tot"><td>Combined</td><td>{yday_trucks}</td><td>{yday_splits}</td><td>{yday_rt:.2f} hrs</td><td>{combined_ute:.1f}%</td><td>{yday_bbls:,.0f}</td><td>{bbl_hr_comb:.0f}</td></tr>
+  </table>
+  <div style="color:#555;font-size:10px;margin-top:6px;">Ute % = runtime \u00f7 21 true available hrs/pump (24hr \u2212 3hr rail switch) &nbsp;\u00b7&nbsp; Feb 2026 avg: 43.9%</div>
 </div>
 
-<h2>&#x1F4C8; March Forecast ({mtd_days}-Day Run Rate)</h2>
-<div class="kpi-grid">
-  <div class="kpi"><div class="kpi-val">{avg_bbls:,.1f}</div><div class="kpi-label">Run Rate Avg bbls/day</div></div>
-  <div class="kpi"><div class="kpi-val">{proj_bbls:,.0f}</div><div class="kpi-label">Projected Total BBLs</div></div>
-  <div class="kpi"><div class="kpi-val">~{proj_trucks:,.0f}</div><div class="kpi-label">Projected Trucks</div></div>
-  <div class="kpi"><div class="kpi-val" style="color:{'#4caf50' if proj_bbls > FEB_TOTAL_BBLS else '#ef5350'}">{'+' if proj_bbls > FEB_TOTAL_BBLS else ''}{proj_bbls - FEB_TOTAL_BBLS:,.0f}</div><div class="kpi-label">vs Feb ({FEB_TOTAL_BBLS:,} BBLs)</div></div>
+<div class="section">
+  <div class="sec-head">\U0001f4c6 Month-to-Date (Mar 1\u2013{d['yesterday_date'].day})</div>
+  <div class="kv"><span class="lbl">MTD Actuals</span><span class="val">{d['total_bbls']:,.0f} BBLs</span></div>
+  <div class="kv"><span class="lbl">Daily Avg ({d['days_actual']} days)</span><span class="val">{d['avg_bbls']:,.1f} bbls/day</span></div>
+  <div class="kv"><span class="lbl">vs Feb Avg (11,200/day)</span><span class="val">{badge(mtd_vs)}</span></div>
+  <div class="kv"><span class="lbl">% of Rail Cap (15k/day)</span><span class="val" style="color:#90caf9">{d['rail_cap']*100:.1f}%</span></div>
+  <div class="kv"><span class="lbl">Days Remaining</span><span class="val">{d['days_remain']}</span></div>
 </div>
 
-<h2>&#x1F4CA; Current Week</h2>
-<table>
-<tr><th>Date</th><th>BBLs</th><th>Trucks</th><th>BBLs/Truck</th><th>vs Run Rate</th></tr>
-{week_rows}
-</table>
-
-<h2>&#x1F4E1; Cadiz Ops Activity</h2>
-<div class="kpi-grid" style="grid-template-columns: 1fr;">
-  <div class="kpi"><div class="kpi-val">Rail Switch {switch_start} &rarr; {switch_end}</div></div>
+<div class="section">
+  <div class="sec-head">\U0001f4c8 March Forecast ({d['days_actual']}-Day Run Rate)</div>
+  <div class="kv"><span class="lbl">Run Rate Avg</span><span class="val">{d['avg_bbls']:,.1f} bbls/day</span></div>
+  <div class="kv"><span class="lbl">Projected Total BBLs</span><span class="val">{d['proj_bbls']:,.0f}</span></div>
+  <div class="kv"><span class="lbl">Projected Trucks</span><span class="val">~{d['proj_trucks']:,.0f}</span></div>
+  <div class="kv"><span class="lbl">vs Feb Actual (313,600 BBLs)</span><span class="val">{badge_abs(vs_feb)}</span></div>
 </div>
 
-<h2>&#x1F69B; Carrier Projections</h2>
-<table>
-<tr><th>Carrier</th><th>Trucks</th><th>Avg BBLs/Truck</th><th>Proj BBLs</th></tr>
-{carrier_rows}
-</table>
-
-<div class="flags">
-<strong>&#x26A0;&#xFE0F; Flags</strong>
-{flags_html}
+<div class="section">
+  <div class="sec-head">\U0001f4ca Week 3 Status (Mar 15\u201321)</div>
+  <table>
+    <tr><th>Date</th><th>BBLs</th><th>Trucks</th><th>BBLs/Truck</th><th>vs Run Rate</th></tr>
+    {week3_rows}
+    <tr class="tot"><td>{week3_total_days}-Day Total</td><td>{week3_total_bbls:,.0f}</td><td>{week3_total_trucks}</td><td>{week3_bpt:.1f}</td><td style="color:#ef5350">{week3_avg_vs:.1f}% avg</td></tr>
+  </table>
+  <div style="color:#555;font-size:11px;margin-top:7px;">Week 1 (Mar 1\u20137): 74,752 BBLs &nbsp;\u00b7&nbsp; Week 2 (Mar 8\u201314): 78,513 BBLs</div>
 </div>
 
-<div class="footer">
-Timiron Midstream Partners &middot; Cadiz Terminal, OH &middot; Auto-generated via GitHub Actions<br>
-Sent from {GMAIL_ADDRESS}
+{cadiz_section}
+<div class="section">
+  <div class="sec-head">\u26a0\ufe0f Flags</div>
+  {flags_html}
+  <div class="flag grn">\U0001f4ce Both Excel files attached \u2014 open directly in Excel.</div>
 </div>
 
-</body></html>"""
-    return html
+</div>
+
+<div class="foot">
+  Timiron Midstream Partners \u00b7 Cadiz Terminal, OH \u00b7 Auto-generated<br>
+  Sent from tyk216@gmail.com \u00b7 {dash_name} \u00b7 {ext_name}
+</div>
+</div></body></html>"""
 
 # ════════════════════════════════════════════════════════════════════════════
-# STEP 4: Send email via Gmail SMTP
+# SEND EMAIL VIA GMAIL SMTP — with both Excel files as real binary attachments
 # ════════════════════════════════════════════════════════════════════════════
 
-def send_email(html_body):
-    today = date.today()
-    day_name = today.strftime('%A')
-    date_long = today.strftime('%B %d, %Y')
-    subject = f"\U0001F4CA Timiron Daily Briefing | {day_name}, {date_long}"
-
-    msg = MIMEMultipart('alternative')
+def send_via_gmail(subject, html_body, attachment_paths):
+    msg = MIMEMultipart('mixed')
+    msg['From']    = GMAIL_ADDRESS
+    msg['To']      = ', '.join(RECIPIENTS)
     msg['Subject'] = subject
-    msg['From'] = GMAIL_ADDRESS
-    msg['To'] = ', '.join(RECIPIENTS)
+
     msg.attach(MIMEText(html_body, 'html'))
 
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
-        smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASS)
-        smtp.send_message(msg)
-    print(f"  Email sent to: {', '.join(RECIPIENTS)}")
+    for path in attachment_paths:
+        with open(path, 'rb') as f:
+            part = MIMEBase('application', 'vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            part.set_payload(f.read())
+        encoders.encode_base64(part)
+        part.add_header('Content-Disposition', 'attachment',
+                        filename=os.path.basename(path))
+        msg.attach(part)
+
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+        server.login(GMAIL_ADDRESS, GMAIL_APP_PASS)
+        server.sendmail(GMAIL_ADDRESS, RECIPIENTS, msg.as_string())
+
+    print(f"  Email sent with {len(attachment_paths)} Excel attachments.")
 
 # ════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ════════════════════════════════════════════════════════════════════════════
 
 def main():
-    today = date.today()
-    print("=" * 60)
+    today    = date.today()
+    date_str = today.strftime('%#m-%#d-%y')
+
+    print("=" * 62)
     print(f"  Timiron Cloud Briefing -- {today.strftime('%B %d, %Y')}")
-    print("=" * 60)
+    print("=" * 62)
 
     # Validate config
     if not MS_GRAPH_REFRESH_TOKEN:
@@ -690,7 +703,10 @@ def main():
     if not GMAIL_APP_PASS:
         print("ERROR: GMAIL_APP_PASS not set"); sys.exit(1)
 
-    # Step 0: Get access token
+    # Use a temp directory for output files
+    tmpdir = tempfile.mkdtemp(prefix="timiron_")
+
+    # Step 0: Authenticate with Graph API
     print("\n[0] Authenticating with Microsoft Graph...")
     if not get_access_token():
         print("  ERROR: Could not authenticate with Microsoft Graph")
@@ -700,30 +716,70 @@ def main():
     print("\n[1] Fetching Cadiz Ops data from Outlook...")
     cadiz_data = fetch_cadiz_ops()
     if cadiz_data:
+        print(f"  Switch: {cadiz_data.get('switch_start')} -> {cadiz_data.get('switch_end')}")
+        print(f"  Carriers: {list(cadiz_data.get('carrier_projections',{}).keys())}")
+    else:
+        print("  Warning: No Cadiz ops data")
+
+    # Step 2: Download Master Load Log from Rob's email attachment
+    print("\n[2] Downloading Master Load Log from email attachment...")
+    excel_bytes, excel_filename = fetch_load_log_excel()
+    if not excel_bytes:
+        print("  ERROR: Could not download load log")
+        sys.exit(1)
+
+    # Step 3: Parse load log with pandas
+    print("\n[3] Parsing load log...")
+    d = parse_load_log(excel_bytes)
+
+    # Step 4: Update Operations Dashboard Excel template
+    print("\n[4] Updating Operations Dashboard...")
+    dash_tpl = find_template("Operations_Dashboard_MASTER")
+    dash_out = os.path.join(tmpdir, f"Timiron_Operations_Dashboard_MASTER_{date_str}.xlsx")
+    update_dashboard(dash_tpl, d, dash_out)
+
+    # Step 5: Update External Report Excel template
+    print("\n[5] Updating External Report...")
+    ext_tpl = find_template("External_Report")
+    ext_out = os.path.join(tmpdir, f"Timiron_External_Report_{date_str}.xlsx")
+    update_external_report(ext_tpl, d, ext_out)
+
+    # Step 6: Build Cadiz ops section
+    print("\n[6] Building Cadiz Ops section...")
+    cadiz_section = ""
+    if cadiz_data:
+        switch_start = cadiz_data.get('switch_start')
+        switch_end   = cadiz_data.get('switch_end')
+        loaded_out   = cadiz_data.get('loaded_cars_out')
+        empty_in     = cadiz_data.get('empty_cars_in')
+        carrier_proj = cadiz_data.get('carrier_projections', {})
+        maint_notes  = cadiz_data.get('maintenance_notes', [])
+        cadiz_section = build_cadiz_section(switch_start, switch_end, loaded_out, empty_in, carrier_proj, maint_notes)
         print("  OK")
     else:
-        print("  Warning: No Cadiz ops data - will show N/A in briefing")
+        print("  No Cadiz data available")
 
-    # Step 2: Fetch Master Load Log data from email attachment
-    print("\n[2] Fetching Master Load Log from email attachment...")
-    load_data = fetch_load_log_data(cadiz_data)
-    if not load_data:
-        print("  ERROR: Could not read load log data")
-        sys.exit(1)
-    print("  OK")
+    # Step 7: Build HTML email and send
+    print("\n[7] Building email and sending via Gmail...")
+    dash_name = os.path.basename(dash_out)
+    ext_name  = os.path.basename(ext_out)
+    subject   = f"\U0001f4ca Timiron Daily Briefing | {today.strftime('%A, %B %d, %Y')}"
+    html_body = build_email_html(d, dash_name, ext_name, cadiz_section)
+    print(f"  HTML size: {len(html_body):,} bytes")
 
-    # Step 3: Build HTML email
-    print("\n[3] Building briefing email...")
-    html = build_briefing_html(load_data, cadiz_data)
-    print(f"  HTML size: {len(html):,} bytes")
+    send_via_gmail(subject, html_body, [dash_out, ext_out])
 
-    # Step 4: Send email
-    print("\n[4] Sending email...")
-    send_email(html)
-
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 62)
     print("  Done.")
-    print("=" * 60)
+    print(f"  {dash_name}")
+    print(f"  {ext_name}")
+    print("=" * 62)
+
+    # Clean up temp files
+    try:
+        shutil.rmtree(tmpdir)
+    except:
+        pass
 
 if __name__ == "__main__":
     main()
