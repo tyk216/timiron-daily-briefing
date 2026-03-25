@@ -1,25 +1,26 @@
 """
 timiron_cloud_briefing.py — Cloud version of Timiron Daily Briefing
 Runs on GitHub Actions at 6 AM ET daily.
-Uses Anthropic API + Zapier MCP for Outlook/OneDrive access.
+Uses Microsoft Graph API directly for Outlook email search and attachments.
 Sends HTML briefing email via Gmail SMTP.
 """
 
-import os, json, re, sys, smtplib, time
+import os, json, re, sys, smtplib, base64, io
 from datetime import date, timedelta, datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import requests
+import pandas as pd
 
 # ════════════════════════════════════════════════════════════════════════════
 # CONFIG — from GitHub Secrets (environment variables)
 # ════════════════════════════════════════════════════════════════════════════
 
-ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
-ZAPIER_MCP_URL    = os.environ.get('ZAPIER_MCP_URL', '')
-GMAIL_ADDRESS     = os.environ.get('GMAIL_ADDRESS', 'tyk216@gmail.com')
-GMAIL_APP_PASS    = os.environ.get('GMAIL_APP_PASS', '')
-RECIPIENTS        = os.environ.get('RECIPIENTS', 'tylerk@timironmp.com,robk@timirontrading.com').split(',')
+MS_GRAPH_REFRESH_TOKEN = os.environ.get('MS_GRAPH_REFRESH_TOKEN', '')
+MS_GRAPH_CLIENT_ID     = os.environ.get('MS_GRAPH_CLIENT_ID', '')
+GMAIL_ADDRESS          = os.environ.get('GMAIL_ADDRESS', 'tyk216@gmail.com')
+GMAIL_APP_PASS         = os.environ.get('GMAIL_APP_PASS', '')
+RECIPIENTS             = os.environ.get('RECIPIENTS', 'tylerk@timironmp.com,robk@timirontrading.com').split(',')
 
 CARRIER_AVGS = {
     'Badlands':          224.6,
@@ -37,172 +38,409 @@ FEB_AVG_DAILY    = 11200
 FEB_TOTAL_BBLS   = 313600
 FEB_AVG_UTE      = 43.9
 
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+TOKEN_URL  = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+
+# Session-level access token (set once at startup)
+ACCESS_TOKEN = None
+
 def rev_per_day(bbls):
     return (min(bbls,5000)*1.30 + max(0,min(bbls-5000,5000))*0.95 + max(0,bbls-10000)*0.75)
 
 # ════════════════════════════════════════════════════════════════════════════
-# STEP 1: Fetch Cadiz Ops data via Claude + Zapier MCP (Outlook search)
+# AUTH — Microsoft Graph OAuth2 refresh token flow
+# ════════════════════════════════════════════════════════════════════════════
+
+def get_access_token():
+    """Exchange refresh token for a new access token."""
+    global ACCESS_TOKEN
+    r = requests.post(TOKEN_URL, data={
+        "client_id":     MS_GRAPH_CLIENT_ID,
+        "grant_type":    "refresh_token",
+        "refresh_token": MS_GRAPH_REFRESH_TOKEN,
+        "scope":         "https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.ReadWrite offline_access",
+    }, timeout=30)
+    if not r.ok:
+        print(f"  Token refresh failed: {r.status_code} {r.text[:300]}")
+        return False
+    data = r.json()
+    ACCESS_TOKEN = data["access_token"]
+    # Log new refresh token if returned (it lasts 90 days)
+    new_rt = data.get("refresh_token")
+    if new_rt:
+        print("  New refresh token received (90-day lifetime). Update secret if needed.")
+    print("  Access token acquired.")
+    return True
+
+def graph_headers():
+    return {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+
+# ════════════════════════════════════════════════════════════════════════════
+# GRAPH HELPERS — search emails, get attachments
+# ════════════════════════════════════════════════════════════════════════════
+
+def search_emails(search_query, top=5):
+    """Search Outlook emails via Graph API. Returns list of message objects."""
+    url = f'{GRAPH_BASE}/me/messages'
+    params = {
+        "$search": f'"{search_query}"',
+        "$top": top,
+        "$select": "id,subject,from,body,receivedDateTime,hasAttachments",
+        "$orderby": "receivedDateTime desc",
+    }
+    r = requests.get(url, headers=graph_headers(), params=params, timeout=30)
+    if not r.ok:
+        print(f"  Search failed for '{search_query}': {r.status_code} {r.text[:200]}")
+        return []
+    return r.json().get("value", [])
+
+def get_attachments(message_id):
+    """Get attachments for a message. Returns list of attachment objects."""
+    url = f'{GRAPH_BASE}/me/messages/{message_id}/attachments'
+    r = requests.get(url, headers=graph_headers(), timeout=60)
+    if not r.ok:
+        print(f"  Get attachments failed: {r.status_code}")
+        return []
+    return r.json().get("value", [])
+
+def get_body_text(msg):
+    """Extract plain text from a message body."""
+    body = msg.get("body", {})
+    content = body.get("content", "")
+    if body.get("contentType") == "html":
+        # Strip HTML tags for parsing
+        content = re.sub(r'<br\s*/?>', '\n', content, flags=re.IGNORECASE)
+        content = re.sub(r'<[^>]+>', '', content)
+        content = re.sub(r'&nbsp;', ' ', content)
+        content = re.sub(r'&#\d+;', '', content)
+    return content.strip()
+
+# ════════════════════════════════════════════════════════════════════════════
+# STEP 1: Fetch Cadiz Ops data via Graph API (Outlook search)
 # ════════════════════════════════════════════════════════════════════════════
 
 def fetch_cadiz_ops():
-    """Search Outlook for switch times and carrier projections."""
+    """Search Outlook for switch times, LOGS, and carrier projections."""
     today = date.today()
     yesterday = today - timedelta(days=1)
     today_str = today.strftime('%m.%d.%y')
     yesterday_str = yesterday.strftime('%m.%d.%y')
-    today_long = today.strftime('%B %d, %Y')
 
-    prompt = f"""Today is {today_long}. Yesterday was {yesterday_str}.
+    result = {
+        "date": yesterday_str,
+        "switch_start": "N/A",
+        "switch_end": "N/A",
+        "loaded_cars_out": 0,
+        "empty_cars_in": 0,
+        "maintenance_notes": [],
+        "carrier_projections": {},
+        "yesterday_bbls_from_logs": None,
+        "yesterday_trucks_from_logs": None,
+    }
 
-TASK: Search Outlook emails and extract Cadiz terminal operations data.
+    # --- RAIL SWAP email ---
+    print("  Searching for RAIL SWAP email...")
+    msgs = search_emails(f"from:cadiz.ops subject:RAIL")
+    for msg in msgs:
+        subj = msg.get("subject", "")
+        if today_str in subj or yesterday_str in subj:
+            body = get_body_text(msg)
+            # Parse: START TIME 3:05 AM
+            start_m = re.search(r'START\s+TIME\s+(\d{1,2}:\d{2}\s*[AP]M)', body, re.IGNORECASE)
+            end_m = re.search(r'END\s+TIME\s+(\d{1,2}:\d{2}\s*[AP]M)', body, re.IGNORECASE)
+            loaded_m = re.search(r'(\d+)\s+LOADED\s+CARS?\s+SENT', body, re.IGNORECASE)
+            empty_m = re.search(r'(\d+)\s+EMPTY\s+CARS?\s+PUSHED', body, re.IGNORECASE)
+            if start_m:
+                result["switch_start"] = start_m.group(1).strip()
+            if end_m:
+                result["switch_end"] = end_m.group(1).strip()
+            if loaded_m:
+                result["loaded_cars_out"] = int(loaded_m.group(1))
+            if empty_m:
+                result["empty_cars_in"] = int(empty_m.group(1))
+            print(f"    Found RAIL SWAP: {result['switch_start']} -> {result['switch_end']}")
+            break
 
-STEP 1: Use microsoft_outlook_find_emails with searchValue "{today_str} RAIL SWAP" to find the rail swap email.
-Extract: START TIME, END TIME, loaded cars out, empty cars in.
+    # --- UPDATE email (switch end / resume time in subject) ---
+    print("  Searching for UPDATE email...")
+    msgs = search_emails(f"from:cadiz.ops subject:UPDATE")
+    for msg in msgs:
+        subj = msg.get("subject", "")
+        if today_str in subj or yesterday_str in subj:
+            # Subject: "03.25.26 4:48 AM UPDATE"
+            time_m = re.search(r'(\d{1,2}:\d{2}\s*[AP]M)\s+UPDATE', subj, re.IGNORECASE)
+            if time_m:
+                result["switch_end"] = time_m.group(1).strip()
+                print(f"    UPDATE resume time: {result['switch_end']}")
+            body = get_body_text(msg)
+            if body.strip():
+                result["maintenance_notes"].append(body.strip()[:200])
+            break
 
-STEP 2: Use microsoft_outlook_find_emails with searchValue "{today_str} UPDATE" to find the update email.
-This tells us when normal operations resumed (switch_end time is in the subject, e.g. "4:48 AM UPDATE").
+    # --- LOGS email (yesterday's BBLs and trucks) ---
+    print("  Searching for LOGS email...")
+    msgs = search_emails(f"from:cadiz.ops subject:LOGS")
+    for msg in msgs:
+        subj = msg.get("subject", "")
+        if today_str in subj or yesterday_str in subj:
+            body = get_body_text(msg)
+            # Parse: "59 TRUCKS - 11,474.24 BBLS"
+            logs_m = re.search(r'(\d+)\s+TRUCKS?\s*[-\u2013]\s*([\d,]+\.?\d*)\s+BBLS?', body, re.IGNORECASE)
+            if logs_m:
+                result["yesterday_trucks_from_logs"] = int(logs_m.group(1))
+                result["yesterday_bbls_from_logs"] = float(logs_m.group(2).replace(',', ''))
+                print(f"    LOGS: {result['yesterday_trucks_from_logs']} trucks, {result['yesterday_bbls_from_logs']} BBLs")
+            break
 
-STEP 3: Use microsoft_outlook_find_emails with searchValue "Re: {today_str}" to find carrier replies.
-Look for truck counts from: Badlands (ohiodispatch@badlands.com), KAG (bxi-bloomingdaledisp@thekag.com),
-Prop Logistics, BD Oil, 1st Choice Energy.
+    # --- Carrier projections ---
+    carrier_searches = {
+        'Badlands':     'from:ohiodispatch subject:UPDATE',
+        'KAG':          'from:bxi-bloomingdale subject:UPDATE',
+    }
+    for cname, query in carrier_searches.items():
+        print(f"  Searching for {cname} carrier reply...")
+        msgs = search_emails(query)
+        trucks = 0
+        note = "No response"
+        for msg in msgs:
+            subj = msg.get("subject", "")
+            recv = msg.get("receivedDateTime", "")
+            # Only today's messages
+            if today.strftime('%Y-%m-%d') in recv[:10]:
+                body = get_body_text(msg)
+                # Look for truck count: "We have 9 planned so far"
+                truck_m = re.search(r'(\d+)\s+(?:planned|trucks?|loads?|scheduled)', body, re.IGNORECASE)
+                if not truck_m:
+                    truck_m = re.search(r'(?:have|running|sending|doing)\s+(\d+)', body, re.IGNORECASE)
+                if truck_m:
+                    trucks = int(truck_m.group(1))
+                    note = ""
+                    print(f"    {cname}: {trucks} trucks")
+                break
 
-Return ONLY valid JSON (no other text) with this structure:
-{{
-  "date": "{yesterday_str}",
-  "switch_start": "3:05 AM",
-  "switch_end": "4:48 AM",
-  "loaded_cars_out": 17,
-  "empty_cars_in": 17,
-  "maintenance_notes": [],
-  "carrier_projections": {{
-    "Badlands": {{"trucks": 9, "proj_bbls": 2021, "note": ""}},
-    "KAG": {{"trucks": 0, "proj_bbls": 0, "note": "No response"}}
-  }}
-}}
+        avg = CARRIER_AVGS.get(cname, 190)
+        result["carrier_projections"][cname] = {
+            "trucks": trucks,
+            "proj_bbls": round(trucks * avg),
+            "note": note,
+        }
 
-Use these avg BBLs/truck for projections: Badlands=224.6, KAG=188.9, Prop Logistics=181.5, BD Oil=188.2, 1st Choice Energy=183.3.
-If a carrier didn't reply, set trucks=0 and note="No response".
-"""
+    # Fill in carriers that don't have dedicated searches
+    for cname in ['Prop Logistics', 'BD Oil', '1st Choice Energy']:
+        if cname not in result["carrier_projections"]:
+            result["carrier_projections"][cname] = {
+                "trucks": 0, "proj_bbls": 0, "note": "No response"
+            }
 
-    try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "anthropic-beta": "mcp-client-2025-04-04",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 4000,
-                "mcp_servers": [{"type": "url", "url": ZAPIER_MCP_URL, "name": "zapier"}],
-                "messages": [{"role": "user", "content": prompt}]
-            },
-            timeout=120
-        )
-        if not r.ok:
-            print(f"  Cadiz ops API error: {r.status_code} {r.text[:200]}")
-            return None
-
-        text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            data = json.loads(match.group())
-            data["date"] = yesterday_str
-            print(f"  Switch: {data.get('switch_start')} -> {data.get('switch_end')}")
-            carriers = data.get('carrier_projections', {})
-            active = [k for k, v in carriers.items() if v.get('trucks', 0) > 0]
-            print(f"  Carriers responding: {active}")
-            return data
-        print(f"  Warning: Could not parse JSON from response")
-        print(f"  Response text: {text[:300]}")
-        return None
-    except Exception as e:
-        print(f"  Cadiz ops fetch error: {e}")
-        return None
+    return result
 
 # ════════════════════════════════════════════════════════════════════════════
-# STEP 2: Fetch Master Load Log data via Claude + Zapier MCP (OneDrive/Excel)
+# STEP 2: Fetch Master Load Log Excel from Rob's email attachment
 # ════════════════════════════════════════════════════════════════════════════
 
-def fetch_load_log_data():
-    """Read Master Load Log data from OneDrive Excel via Zapier MCP."""
+def fetch_load_log_data(cadiz_data=None):
+    """Find Rob's Master Load Log email, download Excel, parse with pandas."""
     yesterday = date.today() - timedelta(days=1)
     yesterday_str = yesterday.strftime('%m.%d.%y')
 
-    prompt = f"""TASK: Find and read the latest Master Load Log from OneDrive.
+    print("  Searching for Master Load Log email from Rob...")
+    msgs = search_emails("from:robk subject:Master Load Log")
 
-STEP 1: Use onedrive_find_file with query "MASTER COPY MASTER LOAD LOG" to find the latest load log file.
-The file is in the Timiron/Claude/Daily Brief folder. Look for one with "{yesterday_str}" in the name.
+    excel_bytes = None
+    for msg in msgs:
+        if not msg.get("hasAttachments"):
+            continue
+        # Get the most recent one
+        attachments = get_attachments(msg["id"])
+        for att in attachments:
+            name = att.get("name", "")
+            if name.lower().endswith(('.xlsx', '.xls')) and 'load log' in name.lower():
+                content_bytes = att.get("contentBytes")
+                if content_bytes:
+                    excel_bytes = base64.b64decode(content_bytes)
+                    print(f"    Found attachment: {name} ({len(excel_bytes):,} bytes)")
+                    break
+        if excel_bytes:
+            break
 
-STEP 2: Once you find the file, use microsoft_excel_get_cells_in_range to read data.
-The workbook has a sheet called "Master_Load_Log".
-Read range A1:J500 to get all March 2026 data.
-The columns are: Date, Timiron BOL#, Truck #, Carrier, Timiron Metered bbls., Pump Time, Split Load, and more.
+    if not excel_bytes:
+        print("  ERROR: Could not find Master Load Log Excel attachment")
+        return None
 
-STEP 3: Process the data and return ONLY valid JSON (no other text):
-{{
-  "yesterday_date": "{yesterday_str}",
-  "yesterday_bbls": 11474.24,
-  "yesterday_trucks": 59,
-  "mtd_days": 24,
-  "mtd_total_bbls": 253109.38,
-  "mtd_total_trucks": 1234,
-  "avg_bbls_per_day": 10546.2,
-  "pump_utilization": {{
-    "P-101": {{"loads": 25, "splits": 6, "runtime_hrs": 10.03, "ute_pct": 47.8, "bbls": 4744, "bbls_hr": 473}},
-    "P-102": {{"loads": 22, "splits": 5, "runtime_hrs": 10.05, "ute_pct": 47.9, "bbls": 4495, "bbls_hr": 447}},
-    "P-103": {{"loads": 12, "splits": 2, "runtime_hrs": 5.4, "ute_pct": 25.7, "bbls": 2236, "bbls_hr": 414}}
-  }},
-  "daily_data": [
-    {{"date": "2026-03-01", "bbls": 10500, "trucks": 52}},
-    ...
-  ]
-}}
+    # Parse with pandas
+    return parse_load_log(excel_bytes, cadiz_data)
 
-IMPORTANT:
-- BOL# starting with 111 = P-101, 222 = P-102, 333 = P-103
-- Pump utilization % = runtime hours / 21 available hours * 100
-- Split loads have "Split #2" in the Split Load column - count them but don't double-count trucks
-- Pump Time format is H:MM - convert to hours
-- Only include March 2026 data
-- "trucks" = unique loads excluding Split #2 rows
-"""
+def parse_load_log(excel_bytes, cadiz_data=None):
+    """Parse the Master Load Log Excel file."""
+    yesterday = date.today() - timedelta(days=1)
+    yesterday_str = yesterday.strftime('%m.%d.%y')
 
     try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "anthropic-beta": "mcp-client-2025-04-04",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 8000,
-                "mcp_servers": [{"type": "url", "url": ZAPIER_MCP_URL, "name": "zapier"}],
-                "messages": [{"role": "user", "content": prompt}]
-            },
-            timeout=180
-        )
-        if not r.ok:
-            print(f"  Load log API error: {r.status_code} {r.text[:200]}")
+        df = pd.read_excel(io.BytesIO(excel_bytes), sheet_name='Master_Load_Log')
+    except Exception as e:
+        print(f"  ERROR reading Excel sheet 'Master_Load_Log': {e}")
+        # Try first sheet as fallback
+        try:
+            df = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=0)
+            print("  Falling back to first sheet")
+        except Exception as e2:
+            print(f"  ERROR reading any sheet: {e2}")
             return None
 
-        text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            data = json.loads(match.group())
-            print(f"  Yesterday: {data.get('yesterday_bbls')} BBLs, {data.get('yesterday_trucks')} trucks")
-            print(f"  MTD: {data.get('mtd_days')} days, {data.get('mtd_total_bbls')} BBLs")
-            return data
-        print(f"  Warning: Could not parse load log JSON")
+    print(f"  Loaded {len(df)} rows from Excel")
+
+    # Normalize column names
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Find relevant columns
+    date_col = None
+    bol_col = None
+    bbls_col = None
+    pump_time_col = None
+    split_col = None
+
+    for c in df.columns:
+        cl = c.lower()
+        if 'date' in cl and date_col is None:
+            date_col = c
+        elif 'bol' in cl and bol_col is None:
+            bol_col = c
+        elif 'metered' in cl and 'bbl' in cl and bbls_col is None:
+            bbls_col = c
+        elif 'pump' in cl and 'time' in cl and pump_time_col is None:
+            pump_time_col = c
+        elif 'split' in cl and split_col is None:
+            split_col = c
+
+    print(f"  Columns mapped: date={date_col}, bol={bol_col}, bbls={bbls_col}, pump_time={pump_time_col}, split={split_col}")
+
+    if not all([date_col, bol_col, bbls_col]):
+        print("  ERROR: Could not find required columns")
         return None
-    except Exception as e:
-        print(f"  Load log fetch error: {e}")
+
+    # Filter to March 2026 data
+    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+    march_start = datetime(2026, 3, 1)
+    march_end = datetime(2026, 3, 31, 23, 59, 59)
+    df_march = df[(df[date_col] >= march_start) & (df[date_col] <= march_end)].copy()
+    print(f"  March 2026 rows: {len(df_march)}")
+
+    if len(df_march) == 0:
+        print("  ERROR: No March 2026 data found")
         return None
+
+    # Determine pump from BOL prefix
+    def get_pump(bol):
+        s = str(bol).strip()
+        if s.startswith('111'):
+            return 'P-101'
+        elif s.startswith('222'):
+            return 'P-102'
+        elif s.startswith('333'):
+            return 'P-103'
+        return None
+
+    df_march['pump'] = df_march[bol_col].apply(get_pump)
+
+    # Identify split loads
+    def is_split2(val):
+        if pd.isna(val):
+            return False
+        return 'split #2' in str(val).lower() or 'split#2' in str(val).lower().replace(' ', '')
+
+    if split_col:
+        df_march['is_split2'] = df_march[split_col].apply(is_split2)
+    else:
+        df_march['is_split2'] = False
+
+    # Parse pump time to hours
+    def parse_pump_time(val):
+        if pd.isna(val):
+            return 0.0
+        s = str(val).strip()
+        m = re.match(r'(\d+):(\d{2})', s)
+        if m:
+            return int(m.group(1)) + int(m.group(2)) / 60.0
+        try:
+            return float(s)
+        except:
+            return 0.0
+
+    if pump_time_col:
+        df_march['pump_hrs'] = df_march[pump_time_col].apply(parse_pump_time)
+    else:
+        df_march['pump_hrs'] = 0.0
+
+    df_march['bbls_val'] = pd.to_numeric(df_march[bbls_col], errors='coerce').fillna(0)
+
+    # --- Yesterday's data ---
+    yesterday_dt = pd.Timestamp(yesterday)
+    df_yday = df_march[df_march[date_col].dt.date == yesterday]
+    yday_bbls = df_yday['bbls_val'].sum()
+    yday_trucks = len(df_yday[~df_yday['is_split2']])
+
+    # Use LOGS email data if available and Excel data seems off
+    if cadiz_data and cadiz_data.get('yesterday_bbls_from_logs'):
+        logs_bbls = cadiz_data['yesterday_bbls_from_logs']
+        logs_trucks = cadiz_data['yesterday_trucks_from_logs']
+        if yday_bbls == 0 and logs_bbls > 0:
+            print(f"  Using LOGS email data for yesterday: {logs_bbls} BBLs, {logs_trucks} trucks")
+            yday_bbls = logs_bbls
+            yday_trucks = logs_trucks
+
+    # --- Pump utilization for yesterday ---
+    pumps = {}
+    for pname in ['P-101', 'P-102', 'P-103']:
+        df_pump = df_yday[df_yday['pump'] == pname]
+        loads = len(df_pump)
+        splits = len(df_pump[df_pump['is_split2']])
+        runtime = df_pump['pump_hrs'].sum()
+        bbls = df_pump['bbls_val'].sum()
+        ute = round(runtime / 21.0 * 100, 1) if runtime > 0 else 0
+        bhr = round(bbls / runtime) if runtime > 0 else 0
+        pumps[pname] = {
+            'loads': loads,
+            'splits': splits,
+            'runtime_hrs': round(runtime, 2),
+            'ute_pct': ute,
+            'bbls': round(bbls),
+            'bbls_hr': bhr,
+        }
+
+    # --- MTD data ---
+    unique_dates = sorted(df_march[date_col].dt.date.unique())
+    mtd_days = len(unique_dates)
+    mtd_total_bbls = df_march['bbls_val'].sum()
+    mtd_total_trucks = len(df_march[~df_march['is_split2']])
+    avg_bbls = round(mtd_total_bbls / mtd_days, 1) if mtd_days > 0 else 0
+
+    # --- Daily data for weekly table ---
+    daily_data = []
+    for d in unique_dates:
+        df_day = df_march[df_march[date_col].dt.date == d]
+        d_bbls = df_day['bbls_val'].sum()
+        d_trucks = len(df_day[~df_day['is_split2']])
+        daily_data.append({
+            "date": d.strftime('%Y-%m-%d'),
+            "bbls": round(d_bbls, 2),
+            "trucks": d_trucks,
+        })
+
+    result = {
+        "yesterday_date": yesterday_str,
+        "yesterday_bbls": round(yday_bbls, 2),
+        "yesterday_trucks": yday_trucks,
+        "mtd_days": mtd_days,
+        "mtd_total_bbls": round(mtd_total_bbls, 2),
+        "mtd_total_trucks": mtd_total_trucks,
+        "avg_bbls_per_day": avg_bbls,
+        "pump_utilization": pumps,
+        "daily_data": daily_data,
+    }
+
+    print(f"  Yesterday: {yday_bbls:,.2f} BBLs, {yday_trucks} trucks")
+    print(f"  MTD: {mtd_days} days, {mtd_total_bbls:,.2f} BBLs, avg {avg_bbls:,.1f}/day")
+    return result
 
 # ════════════════════════════════════════════════════════════════════════════
 # STEP 3: Build HTML email
@@ -446,12 +684,18 @@ def main():
     print("=" * 60)
 
     # Validate config
-    if not ANTHROPIC_API_KEY:
-        print("ERROR: ANTHROPIC_API_KEY not set"); sys.exit(1)
-    if not ZAPIER_MCP_URL:
-        print("ERROR: ZAPIER_MCP_URL not set"); sys.exit(1)
+    if not MS_GRAPH_REFRESH_TOKEN:
+        print("ERROR: MS_GRAPH_REFRESH_TOKEN not set"); sys.exit(1)
+    if not MS_GRAPH_CLIENT_ID:
+        print("ERROR: MS_GRAPH_CLIENT_ID not set"); sys.exit(1)
     if not GMAIL_APP_PASS:
         print("ERROR: GMAIL_APP_PASS not set"); sys.exit(1)
+
+    # Step 0: Get access token
+    print("\n[0] Authenticating with Microsoft Graph...")
+    if not get_access_token():
+        print("  ERROR: Could not authenticate with Microsoft Graph")
+        sys.exit(1)
 
     # Step 1: Fetch Cadiz Ops data from Outlook
     print("\n[1] Fetching Cadiz Ops data from Outlook...")
@@ -461,9 +705,9 @@ def main():
     else:
         print("  Warning: No Cadiz ops data - will show N/A in briefing")
 
-    # Step 2: Fetch Master Load Log data from OneDrive
-    print("\n[2] Fetching Master Load Log from OneDrive...")
-    load_data = fetch_load_log_data()
+    # Step 2: Fetch Master Load Log data from email attachment
+    print("\n[2] Fetching Master Load Log from email attachment...")
+    load_data = fetch_load_log_data(cadiz_data)
     if not load_data:
         print("  ERROR: Could not read load log data")
         sys.exit(1)
