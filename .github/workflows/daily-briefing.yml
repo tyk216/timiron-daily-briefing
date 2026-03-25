@@ -1,0 +1,32 @@
+name: Timiron Daily Briefing
+
+on:
+  schedule:
+    # 6:00 AM ET = 11:00 UTC (EST) or 10:00 UTC (EDT)
+    # Using 10:00 UTC for EDT (March-November)
+    - cron: '0 10 * * *'
+  workflow_dispatch:  # allows manual trigger from GitHub UI
+
+jobs:
+  briefing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily briefing
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ZAPIER_MCP_URL: ${{ secrets.ZAPIER_MCP_URL }}
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
+          RECIPIENTS: ${{ secrets.RECIPIENTS }}
+        run: python timiron_cloud_briefing.py
