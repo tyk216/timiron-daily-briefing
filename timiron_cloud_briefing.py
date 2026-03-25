@@ -225,15 +225,15 @@ def fetch_cadiz_ops():
     return result
 
 # ════════════════════════════════════════════════════════════════════════════
-# FETCH MASTER LOAD LOG — download Excel from Rob's email attachment
+# FETCH MASTER LOAD LOG — download Excel from cadiz.ops LOGS email attachment
 # ════════════════════════════════════════════════════════════════════════════
 
 def fetch_load_log_excel():
-    """Find Rob's Master Load Log email, download Excel attachment.
+    """Find cadiz.ops LOGS email with Master Load Log attachment.
     Returns (excel_bytes, excel_filename) or (None, None).
     """
-    print("  Searching for Master Load Log email from Rob...")
-    msgs = search_emails("from:robk subject:Master Load Log")
+    print("  Searching for LOGS email from cadiz.ops...")
+    msgs = search_emails("from:cadiz.ops subject:LOGS")
 
     for msg in msgs:
         if not msg.get("hasAttachments"):
@@ -721,8 +721,8 @@ def main():
     else:
         print("  Warning: No Cadiz ops data")
 
-    # Step 2: Download Master Load Log from Rob's email attachment
-    print("\n[2] Downloading Master Load Log from email attachment...")
+    # Step 2: Download Master Load Log from cadiz.ops LOGS email attachment
+    print("\n[2] Downloading Master Load Log from cadiz.ops email...")
     excel_bytes, excel_filename = fetch_load_log_excel()
     if not excel_bytes:
         print("  ERROR: Could not download load log")
