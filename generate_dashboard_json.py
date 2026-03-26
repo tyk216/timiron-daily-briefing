@@ -113,8 +113,14 @@ def main():
         },
     }
 
-    # Output JSON to stdout
-    print(json.dumps(output, cls=DateEncoder, indent=2))
+    json_str = json.dumps(output, cls=DateEncoder, indent=2)
+
+    # Write to file path (arg) or default location
+    out_path = sys.argv[1] if len(sys.argv) > 1 else 'pwa/data/dashboard.json'
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    with open(out_path, 'w') as f:
+        f.write(json_str)
+    print(f"  Written to {out_path}", file=sys.stderr)
     print("\nDONE", file=sys.stderr)
 
 

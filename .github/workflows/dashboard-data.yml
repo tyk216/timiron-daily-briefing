@@ -26,16 +26,11 @@ jobs:
         env:
           MS_GRAPH_REFRESH_TOKEN: ${{ secrets.MS_GRAPH_REFRESH_TOKEN }}
           MS_GRAPH_CLIENT_ID: ${{ secrets.MS_GRAPH_CLIENT_ID }}
-        run: python generate_dashboard_json.py > /tmp/dashboard.json
+        run: python generate_dashboard_json.py pwa/data/dashboard.json
 
-      - name: Deploy to gh-pages
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin gh-pages || git checkout --orphan gh-pages
-          git checkout gh-pages
-          mkdir -p data
-          cp /tmp/dashboard.json data/dashboard.json
-          git add data/dashboard.json
-          git diff --cached --quiet || git commit -m "Update dashboard data $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          git push origin gh-pages
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy pwa --project-name cadiz-ops --commit-dirty=true
