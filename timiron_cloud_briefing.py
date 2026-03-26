@@ -341,7 +341,8 @@ def parse_load_log(excel_bytes):
                 'trucks': actual_trucks,
                 'bbls': actual_bbls,
             }
-        print(f"  Carrier actuals: {', '.join(f'{k}={v[\"trucks\"]}' for k,v in carrier_actuals.items())}")
+        actuals_str = ', '.join(f'{k}={v["trucks"]}' for k,v in carrier_actuals.items())
+        print(f"  Carrier actuals: {actuals_str}")
 
     return dict(
         yesterday_date=yesterday_date, days_actual=days_actual, days_remain=days_remain,
