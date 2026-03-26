@@ -180,8 +180,15 @@ def fetch_cadiz_ops():
                 result["switch_end"] = time_m.group(1).strip()
                 print(f"    UPDATE resume time: {result['switch_end']}")
             body = get_body_text(msg)
+            # Only capture actual maintenance keywords, not entire email body
+            maint_keywords = ['pump', 'repair', 'replace', 'fix', 'broke', 'leak', 'down', 'out of service',
+                              'maintenance', 'welding', 'valve', 'hose', 'motor', 'pressure', 'gauge']
             if body.strip():
-                result["maintenance_notes"].append(body.strip()[:200])
+                lines = body.strip().split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if line and len(line) > 10 and any(kw in line.lower() for kw in maint_keywords):
+                        result["maintenance_notes"].append(line[:200])
             break
 
     # --- Carrier projections ---
@@ -319,6 +326,23 @@ def parse_load_log(excel_bytes):
     print(f"  Projected: {proj_bbls:,.0f} BBLs | {proj_trucks:,.0f} trucks")
     print(f"  Pump Ute:  P-101 {pump_ute['P-101']['ute']}%  P-102 {pump_ute['P-102']['ute']}%  P-103 {pump_ute['P-103']['ute']}%  Combined {combined_rt/(21*3)*100:.1f}%")
 
+    # Carrier actuals from yesterday's load log
+    carrier_name_map = {'BD OIL': 'BD Oil'}  # normalize casing
+    carrier_actuals = {}
+    if 'Carrier' in march.columns:
+        yday_carriers = yday.copy()
+        # Exclude Split #2 rows for truck count
+        yday_no_split = yday_carriers[~yday_carriers['Split Load'].astype(str).str.contains('Split #2', na=False)]
+        for carrier_name, grp in yday_no_split.groupby('Carrier'):
+            normalized = carrier_name_map.get(carrier_name, carrier_name)
+            actual_trucks = len(grp)
+            actual_bbls = round(yday_carriers[yday_carriers['Carrier'] == carrier_name]['Metered'].sum(), 1)
+            carrier_actuals[normalized] = {
+                'trucks': actual_trucks,
+                'bbls': actual_bbls,
+            }
+        print(f"  Carrier actuals: {', '.join(f'{k}={v[\"trucks\"]}' for k,v in carrier_actuals.items())}")
+
     return dict(
         yesterday_date=yesterday_date, days_actual=days_actual, days_remain=days_remain,
         total_bbls=round(total_bbls,2), total_trucks=int(total_trucks),
@@ -328,6 +352,7 @@ def parse_load_log(excel_bytes):
         rail_cap=round(rail_cap,6), pump_ute=pump_ute,
         pump_ute_combined=round(combined_rt/(21*3),3),
         p101_hrs=round(p101,2), p102_hrs=round(p102,2), p103_hrs=round(p103,2),
+        carrier_actuals=carrier_actuals,
     )
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -424,10 +449,13 @@ def calc_switch_duration(start_str, end_str):
     except:
         return ""
 
-def build_cadiz_section(switch_start, switch_end, loaded_out, empty_in, carrier_proj, maint_notes):
-    """Build the Cadiz Ops Activity + Carrier Projections HTML section."""
+def build_cadiz_section(switch_start, switch_end, loaded_out, empty_in, carrier_proj, maint_notes, carrier_actuals=None):
+    """Build the Cadiz Ops Activity + Carrier Performance HTML section."""
 
-    has_content = any([switch_start, carrier_proj, maint_notes])
+    if carrier_actuals is None:
+        carrier_actuals = {}
+
+    has_content = any([switch_start, carrier_proj, carrier_actuals, maint_notes])
     if not has_content:
         return ""
 
@@ -444,38 +472,83 @@ def build_cadiz_section(switch_start, switch_end, loaded_out, empty_in, carrier_
         dur = f" &nbsp;\u00b7&nbsp; {duration_str}" if duration_str else ""
         switch_html = f'<div class="kv"><span class="lbl">Rail Switch</span><span class="val">{switch_start} \u2192 {switch_end}{dur}{cars_str}</span></div>'
 
-    # Maintenance notes
+    # Maintenance notes — only show if we have real maintenance items
     maint_html = ""
-    for note in maint_notes:
-        maint_html += f'<div class="kv"><span class="lbl">Maintenance</span><span class="val" style="color:#90caf9;">{note[:120]}</span></div>'
+    if maint_notes:
+        for note in maint_notes:
+            maint_html += f'<div class="kv"><span class="lbl">Maintenance</span><span class="val" style="color:#90caf9;">{note[:150]}</span></div>'
 
-    # Carrier projections table
+    # Carrier Performance table — projected vs actual
     carrier_html = ""
-    if carrier_proj:
-        all_carriers = ['Badlands','KAG','Prop Logistics','BD Oil','1st Choice Energy']
-        total_trucks = 0
-        total_bbls   = 0
-        rows = ""
-        for c in all_carriers:
-            if c in carrier_proj:
-                p = carrier_proj[c]
-                avg = CARRIER_AVGS.get(c, 190)
-                if p['trucks'] == 0:
-                    note = p.get('note','0 trucks')
-                    rows += f'<tr><td style="color:#555;">{c}</td><td style="color:#555;">0</td><td style="color:#555;">\u2014</td><td style="color:#555;font-style:italic;">{note}</td></tr>'
-                else:
-                    total_trucks += p['trucks']
-                    total_bbls   += p['proj_bbls']
-                    rows += f'<tr><td>{c}</td><td>{p["trucks"]}</td><td>{avg}</td><td>{p["proj_bbls"]:,}</td></tr>'
+    all_carriers = ['Badlands', 'KAG', 'Prop Logistics', 'BD Oil', '1st Choice Energy']
+    total_proj_trucks = 0
+    total_actual_trucks = 0
+    total_actual_bbls = 0
+    rows = ""
+
+    for c in all_carriers:
+        proj = carrier_proj.get(c, {})
+        actual = carrier_actuals.get(c, {})
+        proj_trucks = proj.get('trucks', 0)
+        actual_trucks = actual.get('trucks', 0)
+        actual_bbls = actual.get('bbls', 0)
+
+        # Projection column
+        if proj_trucks > 0:
+            proj_str = str(proj_trucks)
+            total_proj_trucks += proj_trucks
+        elif proj.get('note') == 'No response':
+            proj_str = '<span style="color:#666;font-style:italic;">\u2014</span>'
+        else:
+            proj_str = '0'
+
+        # Actual column
+        if actual_trucks > 0:
+            actual_str = str(actual_trucks)
+            bbls_str = f"{actual_bbls:,.0f}"
+            total_actual_trucks += actual_trucks
+            total_actual_bbls += actual_bbls
+        else:
+            actual_str = '<span style="color:#666;">0</span>'
+            bbls_str = '<span style="color:#666;">\u2014</span>'
+
+        # Variance column
+        if proj_trucks > 0 and actual_trucks > 0:
+            var = actual_trucks - proj_trucks
+            if var > 0:
+                var_str = f'<span style="color:#4caf50;">+{var}</span>'
+            elif var < 0:
+                var_str = f'<span style="color:#ef5350;">{var}</span>'
             else:
-                rows += f'<tr><td style="color:#444;">{c}</td><td style="color:#444;" colspan="3" style="font-style:italic;">No response</td></tr>'
+                var_str = '<span style="color:#888;">0</span>'
+        elif proj_trucks == 0 and actual_trucks > 0:
+            var_str = '<span style="color:#888;">\u2014</span>'
+        elif proj_trucks > 0 and actual_trucks == 0:
+            var_str = f'<span style="color:#ef5350;">-{proj_trucks}</span>'
+        else:
+            var_str = '<span style="color:#666;">\u2014</span>'
 
-        total_row = f'<tr class="tot"><td>Total</td><td>{total_trucks}</td><td>\u2014</td><td>~{total_bbls:,} BBLs</td></tr>'
+        rows += f'<tr><td>{c}</td><td>{proj_str}</td><td>{actual_str}</td><td>{bbls_str}</td><td>{var_str}</td></tr>'
 
-        carrier_html = f"""
-  <div class="sec-head" style="margin-top:10px;">\U0001f69b Carrier Projections</div>
+    # Total row
+    proj_total_str = str(total_proj_trucks) if total_proj_trucks > 0 else '\u2014'
+    total_var = total_actual_trucks - total_proj_trucks if total_proj_trucks > 0 else 0
+    if total_proj_trucks > 0:
+        if total_var > 0:
+            var_total_str = f'<span style="color:#4caf50;">+{total_var}</span>'
+        elif total_var < 0:
+            var_total_str = f'<span style="color:#ef5350;">{total_var}</span>'
+        else:
+            var_total_str = '0'
+    else:
+        var_total_str = '\u2014'
+
+    total_row = f'<tr class="tot"><td>Total</td><td>{proj_total_str}</td><td>{total_actual_trucks}</td><td>{total_actual_bbls:,.0f} BBLs</td><td>{var_total_str}</td></tr>'
+
+    carrier_html = f"""
+  <div class="sec-head" style="margin-top:10px;">\U0001f69b Carrier Performance</div>
   <table>
-    <tr><th>Carrier</th><th>Trucks</th><th>Avg BBLs/Truck</th><th>Proj BBLs</th></tr>
+    <tr><th>Carrier</th><th>Projected</th><th>Actual</th><th>Actual BBLs</th><th>Variance</th></tr>
     {rows}
     {total_row}
   </table>"""
@@ -754,7 +827,8 @@ def main():
         empty_in     = cadiz_data.get('empty_cars_in')
         carrier_proj = cadiz_data.get('carrier_projections', {})
         maint_notes  = cadiz_data.get('maintenance_notes', [])
-        cadiz_section = build_cadiz_section(switch_start, switch_end, loaded_out, empty_in, carrier_proj, maint_notes)
+        carrier_actuals = d.get('carrier_actuals', {})
+        cadiz_section = build_cadiz_section(switch_start, switch_end, loaded_out, empty_in, carrier_proj, maint_notes, carrier_actuals)
         print("  OK")
     else:
         print("  No Cadiz data available")
