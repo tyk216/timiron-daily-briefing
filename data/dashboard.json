@@ -1,0 +1,208 @@
+{
+  "generated_at": "2026-03-27T10:13:00Z",
+  "source_file": "MASTER COPY - FEB MASTER LOAD LOG (API)",
+  "source_last_modified": "2026-03-27T10:13:00+00:00",
+  "terminal": "Cadiz Terminal",
+  "company": "Timiron Midstream Partners",
+  "month": "March",
+  "month_abbr": "Mar",
+  "year": 2026,
+  "days_in_month": 31,
+  "yesterday": {
+    "date": "2026-03-27",
+    "bbls": 881.0,
+    "trucks": 5,
+    "splits": 1,
+    "live": true
+  },
+  "yesterday_actual": {
+    "date": "2026-03-26",
+    "bbls": 9859.26,
+    "trucks": 50,
+    "splits": 10,
+    "avg_api": 55.67,
+    "avg_bsw": 0.08
+  },
+  "pump_utilization": {
+    "P-101": {
+      "loads": 3,
+      "splits": 1,
+      "runtime": 0.92,
+      "ute": 4.4,
+      "bbls": 324.0,
+      "bbl_hr": 353.0
+    },
+    "P-102": {
+      "loads": 3,
+      "splits": 0,
+      "runtime": 1.22,
+      "ute": 5.8,
+      "bbls": 557.0,
+      "bbl_hr": 458.0
+    }
+  },
+  "pump_available_hrs": 21,
+  "mtd": {
+    "total_bbls": 276242.54,
+    "total_trucks": 1377,
+    "days_actual": 27,
+    "days_remain": 4,
+    "avg_bbls": 10231.2,
+    "avg_trucks": 51.0,
+    "rail_cap_pct": 68.2
+  },
+  "projection": {
+    "proj_bbls": 317167,
+    "proj_trucks": 1581,
+    "proj_rev": 349899,
+    "ebitda": 328838
+  },
+  "prior_month": {
+    "name": "Feb",
+    "total_bbls": 313600,
+    "avg_bbls_per_day": 11200
+  },
+  "day_trend": [
+    {
+      "date": "2026-03-23",
+      "bbls": 9943.57,
+      "trucks": 50
+    },
+    {
+      "date": "2026-03-24",
+      "bbls": 11474.24,
+      "trucks": 59
+    },
+    {
+      "date": "2026-03-25",
+      "bbls": 12392.9,
+      "trucks": 63
+    },
+    {
+      "date": "2026-03-26",
+      "bbls": 9859.26,
+      "trucks": 50
+    },
+    {
+      "date": "2026-03-27",
+      "bbls": 881.0,
+      "trucks": 5
+    }
+  ],
+  "weeks": [
+    {
+      "week_num": 1,
+      "start": "2026-03-01",
+      "end": "2026-03-07",
+      "total_bbls": 73752.0,
+      "total_trucks": 365,
+      "days": 7,
+      "avg_bbls": 10536.0,
+      "bpt": 202.1
+    },
+    {
+      "week_num": 2,
+      "start": "2026-03-08",
+      "end": "2026-03-14",
+      "total_bbls": 79514.0,
+      "total_trucks": 393,
+      "days": 7,
+      "avg_bbls": 11359.1,
+      "bpt": 202.3
+    },
+    {
+      "week_num": 3,
+      "start": "2026-03-15",
+      "end": "2026-03-21",
+      "total_bbls": 68713.0,
+      "total_trucks": 343,
+      "days": 7,
+      "avg_bbls": 9816.1,
+      "bpt": 200.3
+    },
+    {
+      "week_num": 4,
+      "start": "2026-03-22",
+      "end": "2026-03-27",
+      "total_bbls": 54264.0,
+      "total_trucks": 276,
+      "days": 6,
+      "avg_bbls": 9044.0,
+      "bpt": 196.6
+    }
+  ],
+  "carrier_actuals": {
+    "KAG": {
+      "trucks": 4,
+      "bbls": 702.8
+    },
+    "Prop Logistics": {
+      "trucks": 1,
+      "bbls": 178.2
+    }
+  },
+  "carrier_rolling_avgs": {
+    "KAG": {
+      "avg_bbls_per_truck": 190.4,
+      "avg_trucks_per_day": 22.0,
+      "total_trucks": 594,
+      "total_bbls": 113084.0
+    },
+    "Badlands": {
+      "avg_bbls_per_truck": 233.9,
+      "avg_trucks_per_day": 14.4,
+      "total_trucks": 390,
+      "total_bbls": 91215.0
+    },
+    "BD OIL": {
+      "avg_bbls_per_truck": 189.8,
+      "avg_trucks_per_day": 1.7,
+      "total_trucks": 46,
+      "total_bbls": 8732.5
+    },
+    "1st Choice Energy": {
+      "avg_bbls_per_truck": 181.8,
+      "avg_trucks_per_day": 1.0,
+      "total_trucks": 28,
+      "total_bbls": 5089.9
+    },
+    "Prop Logistics": {
+      "avg_bbls_per_truck": 182.2,
+      "avg_trucks_per_day": 11.8,
+      "total_trucks": 319,
+      "total_bbls": 58121.0
+    }
+  },
+  "wday_wkend": {
+    "weekday": {
+      "days": 20,
+      "total_bbls": 208549.8,
+      "avg_bbls": 10427.5,
+      "total_trucks": 1040,
+      "avg_trucks": 52.0
+    },
+    "weekend": {
+      "days": 7,
+      "total_bbls": 67692.7,
+      "avg_bbls": 9670.4,
+      "total_trucks": 337,
+      "avg_trucks": 48.1
+    }
+  },
+  "config": {
+    "pump_available_hrs": 21,
+    "rail_cap_daily_bbls": 15000,
+    "pumps": [
+      "P-101",
+      "P-102",
+      "P-103"
+    ],
+    "carriers": [
+      "KAG",
+      "Badlands",
+      "BD OIL",
+      "1st Choice Energy",
+      "Prop Logistics"
+    ]
+  }
+}
