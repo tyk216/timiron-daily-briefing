@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#1a1a1a">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Cadiz Terminal Ops</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #1a1a1a;
+    font-family: 'Courier New', monospace;
+    color: #e0e0e0;
+    padding: 12px;
+    padding-top: env(safe-area-inset-top, 12px);
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  .wrap { max-width: 680px; margin: 0 auto; }
+
+  /* Header */
+  .header {
+    display: flex; justify-content: space-between; align-items: center;
+    border-bottom: 1px solid #444; padding-bottom: 8px; margin-bottom: 4px;
+  }
+  .header-title { color: #fff; font-size: 14px; font-weight: bold; }
+  .refresh-btn {
+    background: #333; border: 1px solid #555; color: #aaa; padding: 5px 10px;
+    border-radius: 3px; font-family: 'Courier New', monospace; font-size: 11px;
+    cursor: pointer; transition: all 0.2s;
+  }
+  .refresh-btn:active { background: #444; color: #fff; }
+  .refresh-btn.loading { color: #FFD100; }
+  .sub { color: #666; font-size: 10px; margin-bottom: 14px; }
+  .sub .stale { color: #ef5350; font-weight: bold; }
+  .sub .fresh { color: #4caf50; }
+
+  /* Sections */
+  .section {
+    background: #242424; border: 1px solid #333; border-radius: 3px;
+    padding: 12px 14px; margin-bottom: 10px;
+  }
+  .sec-head {
+    color: #999; font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+    margin-bottom: 8px; border-bottom: 1px solid #2e2e2e; padding-bottom: 5px;
+  }
+  .kv {
+    display: flex; justify-content: space-between; padding: 3px 0;
+    font-size: 12px; border-bottom: 1px solid #2a2a2a;
+  }
+  .kv:last-child { border-bottom: none; }
+  .lbl { color: #888; }
+  .val { color: #ddd; font-weight: bold; text-align: right; }
+
+  /* Tables */
+  .tbl-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 2px; }
+  th { color: #777; font-weight: normal; text-align: left; padding: 4px 5px; border-bottom: 1px solid #333; font-size: 9px; white-space: nowrap; }
+  td { padding: 4px 5px; border-bottom: 1px solid #2a2a2a; color: #ccc; white-space: nowrap; }
+  tr.tot td { color: #fff; font-weight: bold; background: #2d2d2d; border-top: 1px solid #444; }
+  tr.wkend td { background: #1e1e2a; }
+
+  /* Badges */
+  .pos { color: #4caf50; } .neg { color: #ef5350; } .info { color: #90caf9; }
+
+  /* Flags */
+  .flag {
+    padding: 5px 9px; margin-bottom: 5px; border-left: 3px solid #FFD100;
+    background: #2a2700; font-size: 11px; border-radius: 2px;
+  }
+  .flag.grn { border-left-color: #4caf50; background: #162016; }
+  .flag.red { border-left-color: #ef5350; background: #2a1515; }
+
+  /* Footer */
+  .foot { color: #444; font-size: 9px; text-align: center; margin-top: 12px; border-top: 1px solid #2a2a2a; padding-top: 8px; }
+
+  /* Pull to refresh indicator */
+  .ptr-indicator {
+    text-align: center; color: #555; font-size: 10px; padding: 8px;
+    display: none; transition: all 0.2s;
+  }
+  .ptr-indicator.active { display: block; color: #FFD100; }
+
+  /* Loading state */
+  .loading-overlay {
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: #1a1a1a; display: flex; align-items: center; justify-content: center;
+    z-index: 100; font-size: 14px; color: #666;
+  }
+  .loading-overlay.hidden { display: none; }
+
+  /* Offline banner */
+  .offline-banner {
+    background: #2a2700; border: 1px solid #FFD100; color: #FFD100;
+    text-align: center; padding: 6px; font-size: 10px; border-radius: 3px;
+    margin-bottom: 10px; display: none;
+  }
+  .offline-banner.show { display: block; }
+</style>
+</head>
+<body>
+
+<div class="loading-overlay" id="loader">Loading Cadiz Terminal data...</div>
+
+<div class="wrap" id="app" style="display:none;">
+  <div class="offline-banner" id="offline-banner">OFFLINE - showing last cached data</div>
+  <div class="ptr-indicator" id="ptr">Pull to refresh...</div>
+
+  <div class="header">
+    <div class="header-title" id="h-title">Cadiz Terminal Ops</div>
+    <button class="refresh-btn" id="refresh-btn" onclick="refreshData()">Refresh</button>
+  </div>
+  <div class="sub" id="h-sub"></div>
+
+  <!-- Yesterday -->
+  <div class="section" id="sec-yesterday"></div>
+
+  <!-- Yesterday Actual -->
+  <div class="section" id="sec-yesterday-actual"></div>
+
+  <!-- Carrier Performance (moved below Yesterday per Tyler) -->
+  <div class="section" id="sec-carriers"></div>
+
+  <!-- Pump Utilization -->
+  <div class="section" id="sec-pumps"></div>
+
+  <!-- 5-Day Trend -->
+  <div class="section" id="sec-trend"></div>
+
+  <!-- MTD -->
+  <div class="section" id="sec-mtd"></div>
+
+  <!-- Weekly Breakdown -->
+  <div class="section" id="sec-weeks"></div>
+
+  <!-- Projection -->
+  <div class="section" id="sec-proj"></div>
+
+  <!-- Flags -->
+  <div class="section" id="sec-flags"></div>
+
+  <div class="foot" id="foot"></div>
+</div>
+
+<script>
+const DATA_URL = 'data/dashboard.json';
+const REFRESH_WORKER_URL = ''; // Set after Cloudflare Worker is deployed
+const REFRESH_INTERVAL = 30 * 60 * 1000; // 30 min
+let lastData = null;
+
+// ── Helpers ─────────────────────────────────────────────────────
+function fmt(n, dec=0) { return n.toLocaleString('en-US', {minimumFractionDigits: dec, maximumFractionDigits: dec}); }
+function pct(val) {
+  const c = val >= 0 ? 'pos' : 'neg';
+  const s = val >= 0 ? '+' : '';
+  return `<span class="${c}">${s}${val.toFixed(1)}%</span>`;
+}
+function pctAbs(val) {
+  const c = val >= 0 ? 'pos' : 'neg';
+  const s = val >= 0 ? '+' : '';
+  return `<span class="${c}">${s}${fmt(val,0)} BBLs</span>`;
+}
+function dayName(iso) {
+  const d = new Date(iso + 'T12:00:00');
+  return d.toLocaleDateString('en-US', {weekday: 'short'});
+}
+function shortDate(iso) {
+  const d = new Date(iso + 'T12:00:00');
+  return d.toLocaleDateString('en-US', {month: 'short', day: 'numeric'});
+}
+function isWeekend(iso) {
+  const d = new Date(iso + 'T12:00:00');
+  return d.getDay() === 0 || d.getDay() === 6;
+}
+function timeAgo(isoStr) {
+  const diff = (Date.now() - new Date(isoStr).getTime()) / 60000;
+  if (diff < 1) return 'just now';
+  if (diff < 60) return Math.round(diff) + ' min ago';
+  if (diff < 1440) return Math.round(diff/60) + ' hr ago';
+  return Math.round(diff/1440) + ' days ago';
+}
+
+// ── Render ──────────────────────────────────────────────────────
+function render(d) {
+  lastData = d;
+  const y = d.yesterday;
+  const pu = d.pump_utilization;
+  const mtd = d.mtd;
+  const proj = d.projection;
+  const prior = d.prior_month;
+  const pumpAvail = d.pump_available_hrs || 21;
+  const pumps = d.config.pumps;
+
+  // Yesterday totals
+  const yBbls = y.bbls;
+  const yTrucks = y.trucks;
+  const ySplits = y.splits;
+  const bpt = yTrucks > 0 ? yBbls / yTrucks : 0;
+  const vsRun = mtd.avg_bbls > 0 ? (yBbls - mtd.avg_bbls) / mtd.avg_bbls * 100 : 0;
+
+  // Combined pump stats
+  let totalRt = 0;
+  pumps.forEach(p => { totalRt += (pu[p]||{}).runtime||0; });
+  const combUte = totalRt / (pumpAvail * pumps.length) * 100;
+  const combBblHr = totalRt > 0 ? yBbls / totalRt : 0;
+
+  // Header
+  const age = timeAgo(d.generated_at);
+  const ageMin = (Date.now() - new Date(d.generated_at).getTime()) / 60000;
+  const freshClass = ageMin > 60 ? 'stale' : 'fresh';
+  document.getElementById('h-sub').innerHTML =
+    `Based on ${shortDate(y.date)} data &middot; Updated <span class="${freshClass}">${age}</span>` +
+    (d.source_last_modified ? ` &middot; Log saved ${timeAgo(d.source_last_modified)}` : '');
+
+  // Yesterday
+  document.getElementById('sec-yesterday').innerHTML = `
+    <div class="sec-head">${y.live ? 'TODAY (LIVE)' : 'Yesterday'} — ${shortDate(y.date)}</div>
+    <div class="kv"><span class="lbl">BBLs</span><span class="val">${fmt(yBbls,2)}</span></div>
+    <div class="kv"><span class="lbl">Trucks</span><span class="val">${yTrucks}</span></div>
+    <div class="kv"><span class="lbl">Avg BBLs / Truck</span><span class="val">${fmt(bpt,1)}</span></div>
+    <div class="kv"><span class="lbl">vs Run Rate</span><span class="val">${pct(vsRun)} (${fmt(yBbls,0)} vs ${fmt(mtd.avg_bbls,0)})</span></div>`;
+
+  // Yesterday Actual
+  const ya = d.yesterday_actual;
+  if (ya) {
+    const yaBpt = ya.trucks > 0 ? ya.bbls / ya.trucks : 0;
+    const yaVsRun = mtd.avg_bbls > 0 ? (ya.bbls - mtd.avg_bbls) / mtd.avg_bbls * 100 : 0;
+    document.getElementById('sec-yesterday-actual').innerHTML = `
+      <div class="sec-head">Yesterday — ${shortDate(ya.date)}</div>
+      <div class="kv"><span class="lbl">BBLs</span><span class="val">${fmt(ya.bbls,2)}</span></div>
+      <div class="kv"><span class="lbl">Trucks</span><span class="val">${ya.trucks}</span></div>
+      <div class="kv"><span class="lbl">Avg BBLs / Truck</span><span class="val">${fmt(yaBpt,1)}</span></div>
+      <div class="kv"><span class="lbl">Avg API Gravity</span><span class="val">${ya.avg_api}</span></div>
+      <div class="kv"><span class="lbl">Avg BSW</span><span class="val">${ya.avg_bsw}%</span></div>
+      <div class="kv"><span class="lbl">vs Run Rate</span><span class="val">${pct(yaVsRun)} (${fmt(ya.bbls,0)} vs ${fmt(mtd.avg_bbls,0)})</span></div>`;
+  } else {
+    document.getElementById('sec-yesterday-actual').innerHTML = '';
+  }
+
+  // Pumps
+  let pRows = '';
+  pumps.forEach(p => {
+    const v = pu[p] || {};
+    pRows += `<tr><td>${p}</td><td>${v.loads||0}</td><td>${v.splits||0}</td><td>${v.runtime||0}</td><td>${v.ute||0}%</td><td>${fmt(v.bbls||0,0)}</td><td>${fmt(v.bbl_hr||0,0)}</td></tr>`;
+  });
+  pRows += `<tr class="tot"><td>Combined</td><td>${yTrucks}</td><td>${ySplits}</td><td>${totalRt.toFixed(2)}</td><td>${combUte.toFixed(1)}%</td><td>${fmt(yBbls,0)}</td><td>${fmt(combBblHr,0)}</td></tr>`;
+  document.getElementById('sec-pumps').innerHTML = `
+    <div class="sec-head">Pump Utilization — ${shortDate(y.date)}</div>
+    <div class="tbl-wrap"><table>
+      <tr><th>Pump</th><th>Loads</th><th>Splits</th><th>Hrs</th><th>Ute%</th><th>BBLs</th><th>BBL/Hr</th></tr>
+      ${pRows}
+    </table></div>
+    <div style="color:#555;font-size:9px;margin-top:4px;">Ute% = runtime / ${pumpAvail} avail hrs/pump</div>`;
+
+  // 5-Day Trend
+  const trend = d.day_trend || [];
+  let tRows = '';
+  trend.forEach((day, i) => {
+    const vs = mtd.avg_bbls > 0 ? (day.bbls - mtd.avg_bbls) / mtd.avg_bbls * 100 : 0;
+    let dod = '—';
+    if (i > 0) {
+      const prev = trend[i-1].bbls;
+      const dodVal = prev > 0 ? (day.bbls - prev) / prev * 100 : 0;
+      dod = pct(dodVal);
+    }
+    const bptD = day.trucks > 0 ? day.bbls / day.trucks : 0;
+    const wk = isWeekend(day.date) ? ' class="wkend"' : '';
+    tRows += `<tr${wk}><td>${shortDate(day.date)} (${dayName(day.date)})</td><td>${fmt(day.bbls,0)}</td><td>${day.trucks}</td><td>${fmt(bptD,1)}</td><td>${pct(vs)}</td><td>${dod}</td></tr>`;
+  });
+
+  // Weekend/weekday
+  const ww = d.wday_wkend || {};
+  const wd = ww.weekday || {};
+  const we = ww.weekend || {};
+  let wwNote = '';
+  if (wd.days > 0 && we.days > 0) {
+    const diff = wd.avg_bbls > 0 ? (we.avg_bbls - wd.avg_bbls) / wd.avg_bbls * 100 : 0;
+    wwNote = `<div style="color:#777;font-size:9px;margin-top:5px;border-top:1px solid #2e2e2e;padding-top:4px;">Weekday: ${fmt(wd.avg_bbls,0)}/day (${wd.days}d) · Weekend: ${fmt(we.avg_bbls,0)}/day (${we.days}d) · ${pct(diff)}</div>`;
+  }
+  document.getElementById('sec-trend').innerHTML = `
+    <div class="sec-head">5-Day Trend</div>
+    <div class="tbl-wrap"><table>
+      <tr><th>Date</th><th>BBLs</th><th>Trk</th><th>B/T</th><th>vs Avg</th><th>DoD</th></tr>
+      ${tRows}
+    </table></div>${wwNote}`;
+
+  // MTD
+  const vsP = prior.avg_bbls_per_day > 0 ? (mtd.avg_bbls - prior.avg_bbls_per_day) / prior.avg_bbls_per_day * 100 : 0;
+  document.getElementById('sec-mtd').innerHTML = `
+    <div class="sec-head">Month-to-Date (${d.month_abbr} 1–${new Date(y.date+'T12:00:00').getDate()})</div>
+    <div class="kv"><span class="lbl">MTD Actuals</span><span class="val">${fmt(mtd.total_bbls,0)} BBLs</span></div>
+    <div class="kv"><span class="lbl">Daily Avg (${mtd.days_actual}d)</span><span class="val">${fmt(mtd.avg_bbls,1)} bbls/day</span></div>
+    <div class="kv"><span class="lbl">vs ${prior.name} (${fmt(prior.avg_bbls_per_day,0)}/day)</span><span class="val">${pct(vsP)}</span></div>
+    <div class="kv"><span class="lbl">Rail Cap</span><span class="val info">${mtd.rail_cap_pct}%</span></div>
+    <div class="kv"><span class="lbl">Days Remaining</span><span class="val">${mtd.days_remain}</span></div>`;
+
+  // Weeks
+  const weeks = d.weeks || [];
+  let wRows = '';
+  weeks.forEach(wk => {
+    const wkVs = mtd.avg_bbls > 0 ? (wk.avg_bbls - mtd.avg_bbls) / mtd.avg_bbls * 100 : 0;
+    const wBpt = wk.total_trucks > 0 ? wk.total_bbls / wk.total_trucks : 0;
+    wRows += `<tr><td>Wk${wk.week_num} (${shortDate(wk.start)}–${new Date(wk.end+'T12:00:00').getDate()})</td><td>${fmt(wk.total_bbls,0)}</td><td>${wk.total_trucks}</td><td>${wk.days}</td><td>${fmt(wk.avg_bbls,0)}</td><td>${fmt(wBpt,1)}</td><td>${pct(wkVs)}</td></tr>`;
+  });
+  document.getElementById('sec-weeks').innerHTML = `
+    <div class="sec-head">Weekly Breakdown</div>
+    <div class="tbl-wrap"><table>
+      <tr><th>Week</th><th>BBLs</th><th>Trk</th><th>Days</th><th>Avg</th><th>B/T</th><th>vs Avg</th></tr>
+      ${wRows}
+    </table></div>`;
+
+  // Projection
+  const vsPriorBbls = proj.proj_bbls - (prior.total_bbls || 0);
+  document.getElementById('sec-proj').innerHTML = `
+    <div class="sec-head">${d.month} Forecast (${mtd.days_actual}-Day Rate)</div>
+    <div class="kv"><span class="lbl">Run Rate</span><span class="val">${fmt(mtd.avg_bbls,1)} bbls/day</span></div>
+    <div class="kv"><span class="lbl">Projected BBLs</span><span class="val">${fmt(proj.proj_bbls,0)}</span></div>
+    <div class="kv"><span class="lbl">Projected Trucks</span><span class="val">~${fmt(proj.proj_trucks,0)}</span></div>
+    <div class="kv"><span class="lbl">vs ${prior.name} (${fmt(prior.total_bbls,0)})</span><span class="val">${pctAbs(vsPriorBbls)}</span></div>`;
+
+  // Carriers
+  const ca = d.carrier_actuals || {};
+  const cr = d.carrier_rolling_avgs || {};
+  const carriers = d.config.carriers || [];
+  let cRows = '';
+  let totT = 0, totB = 0;
+  carriers.forEach(c => {
+    const a = ca[c] || {};
+    const r = cr[c] || {};
+    const t = a.trucks || 0;
+    const b = a.bbls || 0;
+    totT += t; totB += b;
+    const mtdAvg = r.avg_trucks_per_day ? `${r.avg_trucks_per_day.toFixed(1)} / ${fmt(r.avg_bbls_per_truck,0)}` : '—';
+    cRows += `<tr><td>${c}</td><td>${t||'—'}</td><td>${b ? fmt(b,0) : '—'}</td><td style="font-size:9px;">${mtdAvg}</td></tr>`;
+  });
+  cRows += `<tr class="tot"><td>Total</td><td>${totT}</td><td>${fmt(totB,0)}</td><td></td></tr>`;
+  document.getElementById('sec-carriers').innerHTML = `
+    <div class="sec-head">Carrier Performance — ${shortDate(y.date)}</div>
+    <div class="tbl-wrap"><table>
+      <tr><th>Carrier</th><th>Trucks</th><th>BBLs</th><th style="font-size:8px;">MTD (trk/d · b/t)</th></tr>
+      ${cRows}
+    </table></div>`;
+
+  // Flags
+  let flagsHtml = '';
+  // Soft streak
+  if (trend.length >= 4) {
+    const last4 = trend.slice(-4);
+    const allSoft = last4.every(t => mtd.avg_bbls > 0 && (t.bbls - mtd.avg_bbls) / mtd.avg_bbls * 100 < -5);
+    if (allSoft) flagsHtml += `<div class="flag red">${shortDate(last4[0].date)}–${new Date(last4[3].date+'T12:00:00').getDate()} all below run rate — 4+ soft days.</div>`;
+  }
+  // Pump imbalance
+  const utes = pumps.map(p => ({name: p, ute: (pu[p]||{}).ute||0, rt: (pu[p]||{}).runtime||0})).filter(x => x.rt > 0);
+  if (utes.length >= 2) {
+    const maxU = utes.reduce((a,b) => a.ute > b.ute ? a : b);
+    const minU = utes.reduce((a,b) => a.ute < b.ute ? a : b);
+    if (maxU.ute - minU.ute > 10) flagsHtml += `<div class="flag">${minU.name} ${minU.ute}% vs ${maxU.name} ${maxU.ute}% — imbalance.</div>`;
+  }
+  // Low bbls/hr
+  const lowHr = pumps.filter(p => (pu[p]||{}).bbl_hr > 0 && (pu[p]||{}).bbl_hr < 430).map(p => `${p} at ${fmt((pu[p]||{}).bbl_hr,0)}`);
+  if (lowHr.length) flagsHtml += `<div class="flag">BBLs/hr below 430: ${lowHr.join(', ')}</div>`;
+  if (!flagsHtml) flagsHtml = '<div class="flag grn">No flags — operations normal.</div>';
+  document.getElementById('sec-flags').innerHTML = `<div class="sec-head">Flags</div>${flagsHtml}`;
+
+  // Footer
+  document.getElementById('foot').innerHTML = `${d.company} · ${d.terminal} · Auto-updated every 30 min<br>Source: ${d.source_file || 'Load Log'}`;
+
+  // Show app, hide loader
+  document.getElementById('app').style.display = '';
+  document.getElementById('loader').classList.add('hidden');
+}
+
+// ── Data Fetch ──────────────────────────────────────────────────
+async function loadData() {
+  try {
+    const r = await fetch(DATA_URL + '?t=' + Date.now());
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    render(d);
+    document.getElementById('offline-banner').classList.remove('show');
+  } catch(e) {
+    console.error('Fetch error:', e);
+    // Try cached data
+    if (lastData) {
+      document.getElementById('offline-banner').classList.add('show');
+    } else {
+      document.getElementById('loader').textContent = 'Failed to load data. Pull to retry.';
+    }
+  }
+}
+
+async function refreshData() {
+  const btn = document.getElementById('refresh-btn');
+  btn.textContent = 'Refreshing...';
+  btn.classList.add('loading');
+  btn.disabled = true;
+
+  // Trigger worker if configured (for future Cloudflare Worker)
+  if (REFRESH_WORKER_URL) {
+    try { await fetch(REFRESH_WORKER_URL, {mode:'no-cors'}); } catch(e) {}
+    btn.textContent = 'Waiting...';
+    await new Promise(r => setTimeout(r, 90000));
+  }
+
+  // Refetch dashboard.json with cache busting
+  try {
+    const r = await fetch(DATA_URL + '?t=' + Date.now(), {cache: 'no-store'});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    render(d);
+    document.getElementById('offline-banner').classList.remove('show');
+
+    // Show brief success state
+    btn.textContent = 'Updated';
+    btn.style.borderColor = '#4caf50';
+    btn.style.color = '#4caf50';
+    setTimeout(() => {
+      btn.textContent = 'Refresh';
+      btn.classList.remove('loading');
+      btn.style.borderColor = '';
+      btn.style.color = '';
+      btn.disabled = false;
+    }, 1500);
+  } catch(e) {
+    console.error('Refresh error:', e);
+    btn.textContent = 'Failed';
+    btn.style.borderColor = '#ef5350';
+    btn.style.color = '#ef5350';
+    setTimeout(() => {
+      btn.textContent = 'Refresh';
+      btn.classList.remove('loading');
+      btn.style.borderColor = '';
+      btn.style.color = '';
+      btn.disabled = false;
+    }, 2000);
+  }
+}
+
+// ── Pull to Refresh ─────────────────────────────────────────────
+let touchStartY = 0;
+document.addEventListener('touchstart', e => { touchStartY = e.touches[0].clientY; });
+document.addEventListener('touchmove', e => {
+  if (window.scrollY === 0 && e.touches[0].clientY - touchStartY > 60) {
+    document.getElementById('ptr').classList.add('active');
+  }
+});
+document.addEventListener('touchend', () => {
+  if (document.getElementById('ptr').classList.contains('active')) {
+    document.getElementById('ptr').classList.remove('active');
+    loadData();
+  }
+});
+
+// ── Init ────────────────────────────────────────────────────────
+loadData();
+setInterval(loadData, REFRESH_INTERVAL);
+
+// Service worker
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+</script>
+</body>
+</html>
