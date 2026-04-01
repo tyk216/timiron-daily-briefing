@@ -133,13 +133,16 @@ def graph_get(url, params=None, retries=3):
             time.sleep(3)
     return None
 
-def filter_emails(filter_query, top=10, orderby="receivedDateTime desc", select=None):
-    """Query emails using $filter (deterministic, date-aware)."""
+def filter_emails(sender, since, until=None, top=10, select=None):
+    """Query emails by sender and date range using $filter (no contains on subject — Graph doesn't support it on all mailboxes)."""
     url = f'{GRAPH_BASE}/me/messages'
+    filt = f"from/emailAddress/address eq '{sender}' and receivedDateTime ge {since}"
+    if until:
+        filt += f" and receivedDateTime le {until}"
     params = {
-        "$filter": filter_query,
+        "$filter": filt,
         "$top": top,
-        "$orderby": orderby,
+        "$orderby": "receivedDateTime desc",
     }
     if select:
         params["$select"] = select
@@ -147,7 +150,7 @@ def filter_emails(filter_query, top=10, orderby="receivedDateTime desc", select=
     return data.get("value", []) if data else []
 
 def search_emails(search_query, top=5):
-    """Fallback: search emails using $search (relevance-based)."""
+    """Search emails using $search (relevance-based). Used as fallback."""
     url = f'{GRAPH_BASE}/me/messages'
     params = {
         "$search": f'"{search_query}"',
@@ -193,23 +196,20 @@ def fetch_cadiz_ops(yesterday):
         "carrier_projections": {},
     }
 
-    # Use $filter with date range for reliability
-    # Emails from cadiz.ops received in the last 48 hours with UPDATE in subject
     since = (yesterday - timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')
     until = today.strftime('%Y-%m-%dT23:59:59Z')
 
     print("  Searching for UPDATE emails...")
-    update_filter = (
-        f"from/emailAddress/address eq 'cadiz.ops@timirontrading.com' "
-        f"and receivedDateTime ge {since} and receivedDateTime le {until} "
-        f"and contains(subject, 'UPDATE')"
-    )
-    msgs = filter_emails(update_filter, top=20,
+    msgs = filter_emails('cadiz.ops@timirontrading.com', since, until, top=20,
                          select="id,subject,body,receivedDateTime,hasAttachments")
 
+    # Filter UPDATE emails: check subject in Python (Graph $filter can't do contains on subject)
     for msg in msgs:
         subj = msg.get("subject", "")
-        # Only process emails that contain yesterday's date in the subject
+        subj_upper = subj.upper()
+        # Must have UPDATE in subject and yesterday's date
+        if 'UPDATE' not in subj_upper:
+            continue
         if yday_str not in subj and yday_str_alt not in subj:
             continue
         body = get_body_text(msg)
@@ -217,7 +217,6 @@ def fetch_cadiz_ops(yesterday):
 
         # Extract switch times
         if re.search(r'(ON SITE|ARRIVED|HAS ARRIVED)', body, re.IGNORECASE):
-            # Get time from subject (e.g. "03.31.26 11:30 PM UPDATE")
             time_m = re.search(r'(\d{1,2}:\d{2}\s*[AP]M)\s+UPDATE', subj, re.IGNORECASE)
             if time_m:
                 result["switch_times"].append({"start": time_m.group(1).strip(), "type": "start"})
@@ -234,17 +233,12 @@ def fetch_cadiz_ops(yesterday):
             if line and len(line) > 10 and any(kw in line.lower() for kw in maint_keywords):
                 result["maintenance_notes"].append(line[:200])
 
-    # RAIL SWAP email
+    # RAIL SWAP email (same cadiz.ops emails, check for RAIL in subject in Python)
     print("  Searching for RAIL SWAP email...")
-    swap_filter = (
-        f"from/emailAddress/address eq 'cadiz.ops@timirontrading.com' "
-        f"and receivedDateTime ge {since} and receivedDateTime le {until} "
-        f"and contains(subject, 'RAIL')"
-    )
-    swap_msgs = filter_emails(swap_filter, top=5,
-                              select="id,subject,body,receivedDateTime")
-    for msg in swap_msgs:
+    for msg in msgs:
         subj = msg.get("subject", "")
+        if 'RAIL' not in subj.upper():
+            continue
         if yday_str not in subj and yday_str_alt not in subj:
             continue
         body = get_body_text(msg)
@@ -256,18 +250,18 @@ def fetch_cadiz_ops(yesterday):
             result["empty_cars_in"] = int(empty_m.group(1))
 
     # Carrier projections
-    carrier_searches = {
-        'Badlands':     "from/emailAddress/address eq 'ohiodispatch@badlands-ngl.com'",
-        'KAG':          "from/emailAddress/address eq 'bxi-bloomingdale@kagcentral.com'",
+    carrier_senders = {
+        'Badlands': 'ohiodispatch@badlands-ngl.com',
+        'KAG':     'bxi-bloomingdale@kagcentral.com',
     }
-    for cname, filt in carrier_searches.items():
+    for cname, sender in carrier_senders.items():
         print(f"  Searching for {cname} carrier reply...")
         today_start = today.strftime('%Y-%m-%dT00:00:00Z')
-        full_filter = f"{filt} and receivedDateTime ge {today_start}"
-        msgs = filter_emails(full_filter, top=3, select="id,subject,body,receivedDateTime")
+        c_msgs = filter_emails(sender, today_start, top=3,
+                               select="id,subject,body,receivedDateTime")
         trucks = 0
         note = "No response"
-        for msg in msgs:
+        for msg in c_msgs:
             body = get_body_text(msg)
             truck_m = re.search(r'(\d+)\s+(?:planned|trucks?|loads?|scheduled)', body, re.IGNORECASE)
             if not truck_m:
@@ -295,15 +289,12 @@ def fetch_load_log_excel(yesterday):
     """Find the most recent cadiz.ops LOGS email and download the Master Load Log attachment."""
     print("  Searching for LOGS email from cadiz.ops...")
 
-    # Search last 3 days of emails from cadiz.ops with LOGS in subject
+    # Filter by sender + date range, then check subject in Python
     since = (yesterday - timedelta(days=2)).strftime('%Y-%m-%dT00:00:00Z')
-    filt = (
-        f"from/emailAddress/address eq 'cadiz.ops@timirontrading.com' "
-        f"and receivedDateTime ge {since} "
-        f"and contains(subject, 'LOGS') "
-        f"and hasAttachments eq true"
-    )
-    msgs = filter_emails(filt, top=5, select="id,subject,receivedDateTime,hasAttachments")
+    msgs = filter_emails('cadiz.ops@timirontrading.com', since, top=10,
+                         select="id,subject,receivedDateTime,hasAttachments")
+    # Only keep messages with LOGS in subject
+    msgs = [m for m in msgs if 'LOGS' in m.get('subject', '').upper()]
 
     if not msgs:
         # Fallback to $search
