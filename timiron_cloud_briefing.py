@@ -517,31 +517,32 @@ def update_dashboard(template_path, d, output_path):
     shutil.copy(template_path, output_path)
     wb = openpyxl.load_workbook(output_path)
 
-    # Operations Dashboard
+    # Operations Dashboard — v15 column layout:
+    # C1:Month C2:Headcount C3:Revenue C4:Cost C5:Net Income
+    # C6:Total Bbls C7:Bbls/Day C8:Trucks/Day C9:Total Trucks
+    # C10:Rev/Bbl C11:Cost/Bbl C12:Net/Bbl C13:Pump Util% C14:Rail Cap C15:Net/Head
     ws = wb['Operations Dashboard']
     r = find_month_row(ws, d['month_abbr'])
     dt = fmt_date_short(d['yesterday_date'])
     suffix = '\u2020' if d['days_remain'] > 0 else ''
+    bbls_val = d['proj_bbls'] if d['days_remain'] > 0 else d['total_bbls']
+    trucks_val = d['proj_trucks'] if d['days_remain'] > 0 else d['total_trucks']
+    headcount = ws.cell(r, 2).value or 15  # preserve existing headcount
 
     ws.cell(r, 1).value = f"{d['month_name']}{suffix}"
-    ws.cell(r, 3).value = d['proj_rev']
-    ws.cell(r, 5).value = d['ebitda']
-    ws.cell(r, 6).value = d['ebitda']
-    ws.cell(r, 7).value = d['proj_bbls'] if d['days_remain'] > 0 else d['total_bbls']
-    ws.cell(r, 8).value = d['avg_bbls']
-    ws.cell(r, 9).value = d['avg_trucks']
-    ws.cell(r, 10).value = d['proj_trucks'] if d['days_remain'] > 0 else d['total_trucks']
-    ws.cell(r, 11).value = round(d['proj_rev'] / d['proj_bbls'], 2) if d['proj_bbls'] > 0 else 0
-    ws.cell(r, 12).value = round(d['fixed_cost'] / d['proj_bbls'], 3) if d['proj_bbls'] > 0 else 0
-    ws.cell(r, 13).value = round(d['ebitda'] / d['proj_bbls'], 3) if d['proj_bbls'] > 0 else 0
-    ws.cell(r, 14).value = d['pump_ute_combined']
-    ws.cell(r, 15).value = d['rail_cap']
-
-    status = 'FORECAST' if d['days_remain'] > 0 else 'ACTUALS'
-    ws.cell(r + 2, 1).value = (
-        f"\u2020 {d['month_name']} = {status} based on {d['days_actual']}-day actuals "
-        f"({d['avg_bbls']:.1f} bbls/day avg) through {dt}."
-    )
+    ws.cell(r, 3).value = d['proj_rev']                                                     # C3: Revenue
+    ws.cell(r, 5).value = d['ebitda']                                                        # C5: Net Income
+    ws.cell(r, 6).value = round(bbls_val)                                                    # C6: Total Barrels
+    ws.cell(r, 7).value = d['avg_bbls']                                                      # C7: Bbls/Day
+    ws.cell(r, 8).value = d['avg_trucks']                                                    # C8: Trucks/Day
+    ws.cell(r, 9).value = round(trucks_val)                                                  # C9: Total Trucks
+    ws.cell(r, 10).value = round(d['proj_rev'] / bbls_val, 2) if bbls_val > 0 else 0        # C10: Rev/Bbl
+    ws.cell(r, 11).value = round(d['fixed_cost'] / bbls_val, 3) if bbls_val > 0 else 0      # C11: Cost/Bbl
+    ws.cell(r, 12).value = round(d['ebitda'] / bbls_val, 3) if bbls_val > 0 else 0          # C12: Net/Bbl
+    ws.cell(r, 13).value = d['pump_ute_combined']                                            # C13: Pump Util%
+    ws.cell(r, 14).value = d['rail_cap']                                                     # C14: Rail Cap
+    net_per_head = round(d['ebitda'] / headcount) if headcount else 0
+    ws.cell(r, 15).value = net_per_head                                                      # C15: Net/Head
 
     # Pump Runtime
     pr = wb['Pump Runtime']
