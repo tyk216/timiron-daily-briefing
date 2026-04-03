@@ -521,15 +521,43 @@ async function refreshCrewHours(env) {
   const nightRows = rows.filter(r => r.shift === 'Night');
   const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
+  const totalHrs = round(rows.reduce((s, r) => s + r.total, 0), 1);
+
+  // Pull WTD BBLs from dashboard data (same week as crew hours) for efficiency metric
+  let bbls_per_labor_hr = null;
+  let wtd_bbls = null;
+  try {
+    const dashJson = await env.KV.get('dashboard_json');
+    if (dashJson) {
+      const dash = JSON.parse(dashJson);
+      // Sum completed days from trend that fall within this week (Mon-Sun)
+      const mondayStr = fmtD(mondayDate);
+      const todayStr2 = `${todayParts[0]}-${String(todayParts[1]).padStart(2,'0')}-${String(todayParts[2]).padStart(2,'0')}`;
+      const trend = dash.day_trend || [];
+      let weekBbls = 0;
+      for (const t of trend) {
+        if (t.date >= mondayStr && t.date < todayStr2) {
+          weekBbls += t.bbls;
+        }
+      }
+      wtd_bbls = round(weekBbls, 1);
+      if (weekBbls > 0 && totalHrs > 0) {
+        bbls_per_labor_hr = round(weekBbls / totalHrs, 1);
+      }
+    }
+  } catch(e) { /* ignore */ }
+
   const crew = {
     rows,
     week_label: `${months[mondayDate.getUTCMonth()]} ${mondayDate.getUTCDate()}-${months[todayParts[1]-1]} ${todayParts[2]}`,
-    total_hrs: round(rows.reduce((s, r) => s + r.total, 0), 1),
+    total_hrs: totalHrs,
     total_ot: round(rows.reduce((s, r) => s + r.ot, 0), 1),
     day_count: dayRows.length,
     night_count: nightRows.length,
     day_avg: dayRows.length ? round(dayRows.reduce((s,r) => s+r.total, 0) / dayRows.length, 1) : 0,
     night_avg: nightRows.length ? round(nightRows.reduce((s,r) => s+r.total, 0) / nightRows.length, 1) : 0,
+    bbls_per_labor_hr,
+    wtd_bbls,
     generated_at: new Date().toISOString(),
   };
 
