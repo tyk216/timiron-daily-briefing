@@ -204,13 +204,24 @@ function calculateKPIs(rows, startSerial, todaySerial, now) {
     live: true,
   };
 
-  // MTD
+  // MTD — run rate uses only COMPLETED days (exclude today's partial data)
+  const todayKey = fmtDate(now);
   let mtdBbls = 0, mtdTrucks = 0;
-  for (const d of Object.values(daily)) { mtdBbls += d.bbls; mtdTrucks += d.trucks; }
+  let completedBbls = 0, completedTrucks = 0, completedDays = 0;
+  for (const [dayKey, d] of Object.entries(daily)) {
+    mtdBbls += d.bbls;
+    mtdTrucks += d.trucks;
+    if (dayKey !== todayKey) {
+      completedBbls += d.bbls;
+      completedTrucks += d.trucks;
+      completedDays++;
+    }
+  }
   const daysActual = sortedDays.length;
   const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
   const daysRemain = daysInMonth - daysActual;
-  const avgBbls = daysActual > 0 ? mtdBbls / daysActual : 0;
+  // Run rate based on completed days only
+  const avgBbls = completedDays > 0 ? completedBbls / completedDays : 0;
 
   // Projection
   const projBbls = avgBbls * daysInMonth;
@@ -329,12 +340,12 @@ function calculateKPIs(rows, startSerial, todaySerial, now) {
       total_bbls: round(mtdBbls, 2), total_trucks: mtdTrucks,
       days_actual: daysActual, days_remain: daysRemain,
       avg_bbls: round(avgBbls, 1),
-      avg_trucks: daysActual > 0 ? round(mtdTrucks / daysActual, 1) : 0,
+      avg_trucks: completedDays > 0 ? round(completedTrucks / completedDays, 1) : 0,
       rail_cap_pct: round(avgBbls / 15000 * 100, 1),
     },
     projection: {
       proj_bbls: Math.round(projBbls),
-      proj_trucks: daysActual > 0 ? Math.round(mtdTrucks / daysActual * daysInMonth) : 0,
+      proj_trucks: completedDays > 0 ? Math.round(completedTrucks / completedDays * daysInMonth) : 0,
       proj_rev: Math.round(projRev),
       ebitda: Math.round(projRev - fixedCost),
     },

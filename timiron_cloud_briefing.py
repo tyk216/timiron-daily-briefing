@@ -383,11 +383,12 @@ def parse_load_log(excel_bytes, yesterday):
         }
     combined_rt = sum(v['runtime'] for v in pump_ute.values())
 
-    # MTD totals
+    # MTD totals — run rate uses only COMPLETED days (exclude any partial today data)
     is_split2 = lambda s: pd.notna(s) and 'split' in str(s).lower() and '2' in str(s)
-    mtd_no_split = mtd_data[~mtd_data['Split Load'].apply(is_split2)]
+    mtd_completed = mtd_data[mtd_data['Date'] <= yesterday]  # only full days through yesterday
+    mtd_no_split = mtd_completed[~mtd_completed['Split Load'].apply(is_split2)]
     daily_trucks = mtd_no_split.groupby('Date').size()
-    daily_bbls = mtd_data.groupby('Date')['Metered'].sum()
+    daily_bbls = mtd_completed.groupby('Date')['Metered'].sum()
     total_bbls = daily_bbls.sum()
     total_trucks = daily_trucks.sum()
     days_actual = len(daily_bbls)
