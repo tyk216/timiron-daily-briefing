@@ -205,13 +205,13 @@ function calculateKPIs(rows, startSerial, todaySerial, now) {
   };
 
   // MTD — run rate uses only COMPLETED days (exclude today's partial data)
-  const todayKey = fmtDate(now);
+  const todaySerial2 = dateToSerial(now);
   let mtdBbls = 0, mtdTrucks = 0;
   let completedBbls = 0, completedTrucks = 0, completedDays = 0;
   for (const [dayKey, d] of Object.entries(daily)) {
     mtdBbls += d.bbls;
     mtdTrucks += d.trucks;
-    if (dayKey !== todayKey) {
+    if (Number(dayKey) !== todaySerial2) {
       completedBbls += d.bbls;
       completedTrucks += d.trucks;
       completedDays++;
@@ -337,11 +337,13 @@ function calculateKPIs(rows, startSerial, todaySerial, now) {
     pump_utilization: pumpUtil,
     pump_available_hrs: 21,
     mtd: {
-      total_bbls: round(mtdBbls, 2), total_trucks: mtdTrucks,
-      days_actual: daysActual, days_remain: daysRemain,
+      total_bbls: round(completedBbls, 2), total_trucks: completedTrucks,
+      days_actual: completedDays, days_remain: daysInMonth - completedDays,
       avg_bbls: round(avgBbls, 1),
       avg_trucks: completedDays > 0 ? round(completedTrucks / completedDays, 1) : 0,
       rail_cap_pct: round(avgBbls / 15000 * 100, 1),
+      today_bbls: round(mtdBbls - completedBbls, 2),
+      today_trucks: mtdTrucks - completedTrucks,
     },
     projection: {
       proj_bbls: Math.round(projBbls),
