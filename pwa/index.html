@@ -388,13 +388,16 @@ async function loadCrewData() {
     const c = await r.json();
     if (c.error || !c.rows) throw new Error(c.error || 'No data');
 
+    const onClockCount = c.rows.filter(r => r.on_clock).length;
     let tableRows = '';
     for (const row of c.rows) {
       const nameDisplay = row.role ? `${row.name} (${row.role})` : row.name;
       const otStyle = row.ot > 25 ? ' style="color:#ef5350;font-weight:bold"'
                     : row.ot > 0 ? ' style="color:#FFD100"' : '';
       const flag = row.total > 60 ? ' <span class="neg">!!</span>' : '';
-      tableRows += `<tr><td>${nameDisplay}</td><td>${row.shift}</td><td>${fmt(row.total,1)}${flag}</td><td>${fmt(row.reg,1)}</td><td${otStyle}>${fmt(row.ot,1)}</td></tr>`;
+      const clockIcon = row.on_clock ? '<span style="color:#4caf50"> ●</span>' : '';
+      const rowStyle = row.on_clock ? ' style="background:#1a2e1a"' : '';
+      tableRows += `<tr${rowStyle}><td>${nameDisplay}${clockIcon}</td><td>${row.shift}</td><td>${fmt(row.total,1)}${flag}</td><td>${fmt(row.reg,1)}</td><td${otStyle}>${fmt(row.ot,1)}</td></tr>`;
     }
 
     let otNote = '';
@@ -403,7 +406,7 @@ async function loadCrewData() {
     }
 
     document.getElementById('sec-crew').innerHTML = `
-      <div class="sec-head">Crew Hours WTD — ${c.week_label}</div>
+      <div class="sec-head">Crew Hours WTD — ${c.week_label}${onClockCount ? ` · <span style="color:#4caf50">${onClockCount} on clock</span>` : ''}</div>
       <table>
         <tr><th>Name</th><th>Shift</th><th>Total</th><th>Reg</th><th>OT</th></tr>
         ${tableRows}

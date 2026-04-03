@@ -474,14 +474,16 @@ async function refreshCrewHours(env) {
   const activeT = await qbtGet('timesheets', { on_the_clock: 'yes', start_date: fmtD(mondayDate) }, qbtToken);
   const all = { ...completed, ...activeY, ...activeT };
 
-  // Aggregate
+  // Aggregate + track who's currently on the clock
   const emp = {};
+  const onClock = new Set();
   for (const ts of Object.values(all)) {
     const name = users[String(ts.user_id)] || `Unknown (${ts.user_id})`;
     let dur = ts.duration || 0;
     if (dur === 0 && !ts.end) {
       const start = new Date(ts.start);
       dur = Math.floor((nowMs - start.getTime()) / 1000);
+      onClock.add(name);
     }
     emp[name] = (emp[name] || 0) + dur;
   }
@@ -493,13 +495,13 @@ async function refreshCrewHours(env) {
     const total = round(emp[name] / 3600, 1);
     const shift = QBT_DAY_CREW.includes(name) ? 'Day' : 'Night';
     const role = QBT_ROLES[name] || '';
-    rows.push({ name, shift, role, total, reg: Math.min(total, 40), ot: round(Math.max(total - 40, 0), 1) });
+    rows.push({ name, shift, role, total, reg: Math.min(total, 40), ot: round(Math.max(total - 40, 0), 1), on_clock: onClock.has(name) });
   }
   // Anyone not on roster
   for (const [name, secs] of Object.entries(emp)) {
     if (QBT_ROSTER.includes(name)) continue;
     const total = round(secs / 3600, 1);
-    rows.push({ name, shift: '-', role: '', total, reg: Math.min(total, 40), ot: round(Math.max(total - 40, 0), 1) });
+    rows.push({ name, shift: '-', role: '', total, reg: Math.min(total, 40), ot: round(Math.max(total - 40, 0), 1), on_clock: onClock.has(name) });
   }
 
   const dayRows = rows.filter(r => r.shift === 'Day');
