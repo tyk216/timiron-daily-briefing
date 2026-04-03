@@ -29,4 +29,5 @@ jobs:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
           RECIPIENTS: ${{ secrets.RECIPIENTS }}
+          QBT_TOKEN: ${{ secrets.QBT_TOKEN }}
         run: python timiron_cloud_briefing.py

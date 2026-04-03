@@ -13,7 +13,7 @@ v4 changes:
 """
 
 import os, json, re, sys, shutil, smtplib, base64, io, tempfile, calendar, time, traceback
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta, datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -31,6 +31,7 @@ MS_GRAPH_CLIENT_ID     = os.environ.get('MS_GRAPH_CLIENT_ID', '')
 GMAIL_ADDRESS          = os.environ.get('GMAIL_ADDRESS', 'tyk216@gmail.com')
 GMAIL_APP_PASS         = os.environ.get('GMAIL_APP_PASS', '')
 RECIPIENTS             = os.environ.get('RECIPIENTS', 'tylerk@timironmp.com,robk@timirontrading.com').split(',')
+QBT_TOKEN              = os.environ.get('QBT_TOKEN', '')
 
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_DIR = os.path.join(SCRIPT_DIR, "templates")
@@ -513,7 +514,7 @@ def find_month_row(ws, month_str, default_row=16):
             return r
     return default_row
 
-def update_dashboard(template_path, d, output_path):
+def update_dashboard(template_path, d, output_path, crew_hours=None):
     shutil.copy(template_path, output_path)
     wb = openpyxl.load_workbook(output_path)
 
@@ -563,6 +564,34 @@ def update_dashboard(template_path, d, output_path):
     pr.cell(pr_row, 11).value = round(d['p103_hrs'] / avail, 3) if avail > 0 else 0
     partial = f"Partial month thru {dt}" if d['days_remain'] > 0 else "Full month actuals"
     pr.cell(pr_row, 12).value = f"All 3 pumps active \u00b7 {partial}"
+
+    # Headcount & Roster — WTD hours from QBT
+    if crew_hours and 'Headcount & Roster' in wb.sheetnames:
+        hr = wb['Headcount & Roster']
+        # Build lookup: normalize name -> hours
+        hrs_lookup = {}
+        for ch in crew_hours:
+            hrs_lookup[ch["name"].lower()] = ch["total"]
+
+        # Map dashboard names (rows 10-24, col B) to QBT data (col D = WTD)
+        for row in range(10, 25):
+            dash_name = hr.cell(row=row, column=2).value
+            if not dash_name:
+                continue
+            # Normalize: "Shawn Osborne Jr." -> match "Shawn Osborn Jr.", etc.
+            dn = dash_name.lower().replace("osborne", "osborn").replace(" (oz)", "")
+            matched = hrs_lookup.get(dn)
+            if matched is not None:
+                hr.cell(row=row, column=4, value=round(matched, 1))
+
+        # Update header
+        from zoneinfo import ZoneInfo
+        ET_tz = ZoneInfo("America/New_York")
+        now_et = datetime.now(ET_tz)
+        today_et = now_et.date()
+        monday = today_et - timedelta(days=today_et.weekday())
+        hr.cell(row=9, column=4, value=f"WTD\n{fmt_date_short(monday)}-{fmt_date_short(today_et)}")
+        hr.cell(row=27, column=1, value=f"WTD = Week to date through {fmt_date_short(today_et)} (includes active night shift). Avg based on 4 full weeks only.")
 
     wb.save(output_path)
     print(f"  Dashboard saved: {os.path.basename(output_path)}")
@@ -695,7 +724,159 @@ def build_cadiz_section(cadiz_data, carrier_actuals):
   </table>
 </div>"""
 
-def build_email_html(d, dash_name, ext_name, cadiz_section=""):
+# ════════════════════════════════════════════════════════════════════════════
+# QUICKBOOKS TIME - CREW HOURS
+# ════════════════════════════════════════════════════════════════════════════
+
+QBT_API = "https://rest.tsheets.com/api/v1"
+
+QBT_DAY_CREW = [
+    "Cameron Betz", "Shawn Osborn Jr.", "Shane Young", "William Glover",
+    "Austin Tredway", "Gregory Bates", "Jared Wright", "Shawn Osborn Sr.",
+]
+QBT_NIGHT_CREW = [
+    "Jonathan Williams", "Daniel Hough", "Bryan Deoss", "Dustin Fletcher",
+    "Jacob Diloreto", "Nathaniel Medel", "Christopher Wright",
+]
+QBT_ROSTER = QBT_DAY_CREW + QBT_NIGHT_CREW
+QBT_SHAWN_MAP = {
+    "gosborn20@gmail.com": "Shawn Osborn Jr.",
+    "osbornshawn25@gmail.com": "Shawn Osborn Sr.",
+}
+
+def qbt_api_get(endpoint, params):
+    """GET with pagination from QBT API."""
+    all_results = {}
+    page = 1
+    while True:
+        p = dict(params)
+        p["page"] = page
+        p["per_page"] = 200
+        r = requests.get(f"{QBT_API}/{endpoint}",
+                         headers={"Authorization": f"Bearer {QBT_TOKEN}"},
+                         params=p, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("results", {}).get(endpoint, {})
+        if not results:
+            break
+        all_results.update(results)
+        if not data.get("more", False):
+            break
+        page += 1
+    return all_results
+
+def fetch_qbt_crew_hours():
+    """Fetch WTD hours from QuickBooks Time. Returns (rows, week_label) or (None, None) on failure."""
+    if not QBT_TOKEN:
+        print("  QBT_TOKEN not set, skipping crew hours.")
+        return None, None
+
+    try:
+        # Get users
+        raw_users = qbt_api_get("users", {"active": "yes"})
+        users = {}
+        for uid, u in raw_users.items():
+            first = (u.get("first_name") or "").strip()
+            last = (u.get("last_name") or "").strip()
+            email = (u.get("email") or "").strip().lower()
+            full = f"{first} {last}".strip()
+            if email in QBT_SHAWN_MAP:
+                full = QBT_SHAWN_MAP[email]
+            users[str(uid)] = full
+
+        # Current week Mon-Sun
+        from zoneinfo import ZoneInfo
+        ET = ZoneInfo("America/New_York")
+        now_et = datetime.now(ET)
+        today_et = now_et.date()
+        monday = today_et - timedelta(days=today_et.weekday())
+        sunday = monday + timedelta(days=6)
+
+        # Fetch completed timesheets
+        completed = qbt_api_get("timesheets", {
+            "start_date": monday.isoformat(),
+            "end_date": sunday.isoformat(),
+        })
+
+        # Fetch active shifts (check yesterday too for overnight)
+        yesterday = monday - timedelta(days=1)
+        active_y = qbt_api_get("timesheets", {"on_the_clock": "yes", "start_date": yesterday.isoformat()})
+        active_t = qbt_api_get("timesheets", {"on_the_clock": "yes", "start_date": monday.isoformat()})
+        for tid, ts in {**active_y, **active_t}.items():
+            completed[tid] = ts
+
+        # Aggregate per employee
+        emp = {}
+        for tid, ts in completed.items():
+            uid = str(ts.get("user_id", ""))
+            name = users.get(uid, f"Unknown ({uid})")
+            duration = ts.get("duration", 0)
+            if duration == 0 and ts.get("end", "") == "":
+                start_str = ts.get("start", "")
+                if start_str:
+                    start_utc = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                    duration = int((datetime.now(timezone.utc) - start_utc).total_seconds())
+            if name not in emp:
+                emp[name] = 0
+            emp[name] += duration
+
+        # Build rows sorted by roster
+        rows = []
+        for name in QBT_ROSTER:
+            if name in emp:
+                total_hrs = round(emp[name] / 3600, 1)
+                reg = min(total_hrs, 40)
+                ot = round(max(total_hrs - 40, 0), 1)
+                shift = "Day" if name in QBT_DAY_CREW else "Night"
+                rows.append({"name": name, "shift": shift, "total": total_hrs, "reg": reg, "ot": ot})
+        # Add anyone not in roster
+        for name, secs in emp.items():
+            if name not in QBT_ROSTER:
+                total_hrs = round(secs / 3600, 1)
+                rows.append({"name": name, "shift": "-", "total": total_hrs,
+                             "reg": min(total_hrs, 40), "ot": round(max(total_hrs - 40, 0), 1)})
+
+        week_label = f"{fmt_date_short(monday)}-{fmt_date_short(today_et)}"
+        return rows, week_label
+
+    except Exception as e:
+        print(f"  QBT fetch failed: {e}")
+        return None, None
+
+def build_crew_hours_html(rows, week_label):
+    """Build dark-themed HTML section for crew WTD hours."""
+    if not rows:
+        return ""
+
+    total_hrs = sum(r["total"] for r in rows)
+    total_ot = sum(r["ot"] for r in rows)
+
+    table_rows = ""
+    for r in rows:
+        ot_style = ""
+        if r["ot"] > 25:
+            ot_style = ' style="color:#ef5350;font-weight:bold"'
+        elif r["ot"] > 0:
+            ot_style = ' style="color:#FFD100"'
+        flag = ' <span style="color:#ef5350">!!</span>' if r["total"] > 60 else ""
+        table_rows += (
+            f'<tr><td>{r["name"]}</td><td>{r["shift"]}</td>'
+            f'<td>{r["total"]:.1f}{flag}</td><td>{r["reg"]:.1f}</td>'
+            f'<td{ot_style}>{r["ot"]:.1f}</td></tr>\n'
+        )
+
+    return f"""<div class="section">
+  <div class="sec-head">Crew Hours WTD - {week_label}</div>
+  <table>
+    <tr><th>Name</th><th>Shift</th><th>Total</th><th>Reg</th><th>OT</th></tr>
+    {table_rows}
+    <tr class="tot"><td>TOTALS ({len(rows)})</td><td></td><td>{total_hrs:.1f}</td><td>{sum(r['reg'] for r in rows):.1f}</td><td>{total_ot:.1f}</td></tr>
+  </table>
+  <div style="color:#555;font-size:10px;margin-top:6px;">Source: QuickBooks Time API (includes active shifts)</div>
+</div>"""
+
+def build_email_html(d, dash_name, ext_name, cadiz_section="", crew_section=""):
     pu = d['pump_ute']
     dt_str = fmt_date(d['yesterday_date'])
     today_str = datetime.now().strftime('%A, %B %d, %Y')  # cross-platform
@@ -869,6 +1050,8 @@ def build_email_html(d, dash_name, ext_name, cadiz_section=""):
   <div class="flag grn">\U0001f4ce Both Excel files attached.</div>
 </div>
 
+{crew_section}
+
 </div>
 <div class="foot">
   Timiron Midstream Partners \u00b7 Cadiz Terminal, OH \u00b7 Auto-generated<br>
@@ -961,11 +1144,19 @@ def main():
         print("\n[3] Parsing load log...")
         d = parse_load_log(excel_bytes, yesterday)
 
-        # Step 4: Dashboard
-        print("\n[4] Updating Operations Dashboard...")
+        # Step 4a: Fetch crew hours from QuickBooks Time
+        print("\n[4a] Fetching crew hours from QuickBooks Time...")
+        crew_hours, crew_week_label = fetch_qbt_crew_hours()
+        if crew_hours:
+            print(f"  {len(crew_hours)} employees, WTD: {crew_week_label}")
+        else:
+            print("  Skipped (no QBT_TOKEN or fetch failed)")
+
+        # Step 4b: Dashboard
+        print("\n[4b] Updating Operations Dashboard...")
         dash_tpl = find_template("Operations_Dashboard_MASTER")
         dash_out = os.path.join(tmpdir, f"Timiron_Operations_Dashboard_MASTER_{date_str}.xlsx")
-        update_dashboard(dash_tpl, d, dash_out)
+        update_dashboard(dash_tpl, d, dash_out, crew_hours=crew_hours)
 
         # Step 5: External Report
         print("\n[5] Updating External Report...")
@@ -976,10 +1167,11 @@ def main():
         # Step 6: Build email
         print("\n[6] Building email...")
         cadiz_section = build_cadiz_section(cadiz_data, d.get('carrier_actuals', {}))
+        crew_section = build_crew_hours_html(crew_hours, crew_week_label) if crew_hours else ""
         dash_name = os.path.basename(dash_out)
         ext_name = os.path.basename(ext_out)
         subject = f"\U0001f4ca Timiron Daily Briefing | {today.strftime('%A, %B %d, %Y')}"
-        html_body = build_email_html(d, dash_name, ext_name, cadiz_section)
+        html_body = build_email_html(d, dash_name, ext_name, cadiz_section, crew_section)
         print(f"  HTML: {len(html_body):,} bytes")
 
         # Step 7: Send
