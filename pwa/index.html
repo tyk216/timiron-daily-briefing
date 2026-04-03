@@ -402,32 +402,28 @@ function renderEfficiency(c) {
       <td>${m.month}</td><td>${m.hc}</td>
       <td>${fmt(m.hrs,0)}</td><td>${fmt(m.bbls,0)}</td>
       <td style="color:${bphColor};font-weight:${isBest||isWorst?'bold':'normal'}">${fmt(m.bbls_per_hr,1)}</td>
-      <td style="color:${lbColor};font-weight:${isBest||isWorst?'bold':'normal'}">$${m.labor_per_bbl.toFixed(2)}</td>
     </tr>`;
   }
 
   // Current WTD row
   let wtdRow = '';
   if (c.bbls_per_labor_hr && c.wtd_bbls) {
-    const lbbl = c.total_hrs > 0 ? (c.total_hrs * 20 / c.wtd_bbls).toFixed(2) : '-';
     wtdRow = `<tr class="tot">
       <td>WTD</td><td>${c.day_count + c.night_count}</td>
       <td>${fmt(c.total_hrs,0)}</td><td>${fmt(c.wtd_bbls,0)}</td>
       <td style="color:#90caf9;font-weight:bold">${fmt(c.bbls_per_labor_hr,1)}</td>
-      <td style="color:#90caf9;font-weight:bold">$${lbbl}</td>
     </tr>`;
   }
 
   el.innerHTML = `
     <div class="sec-head">Labor Efficiency</div>
     <table>
-      <tr><th>Month</th><th>HC</th><th>Hrs</th><th>BBLs</th><th>BBLs/Hr</th><th>$/BBL</th></tr>
+      <tr><th>Month</th><th>HC</th><th>Hrs</th><th>BBLs</th><th>BBLs/Hr</th></tr>
       ${mRows}
       ${wtdRow}
     </table>
     <div style="color:#555;font-size:9px;margin-top:6px;line-height:1.4;">
-      <b style="color:#777;">BBLs/Labor Hr</b> = barrels moved per crew hour worked (higher = more efficient).<br>
-      <b style="color:#777;">Labor $/BBL</b> = crew cost per barrel at $20/hr base (lower = better).<br>
+      <b style="color:#777;">BBLs/Labor Hr</b> = barrels moved per crew hour worked (higher = more efficient).
       Efficiency rises with volume on flat headcount. Adding crew temporarily lowers it until throughput catches up.
       WTD is partial week — stabilizes by Friday.
     </div>`;
