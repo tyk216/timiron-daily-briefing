@@ -419,14 +419,26 @@ async function refreshCrewHours(env) {
   const qbtToken = await env.KV.get('qbt_token');
   if (!qbtToken) return null;
 
-  // Fetch users
-  const rawUsers = await qbtGet('users', { active: 'yes' }, qbtToken);
-  const users = {};
-  for (const [uid, u] of Object.entries(rawUsers)) {
-    const first = (u.first_name || '').trim();
-    const last = (u.last_name || '').trim();
-    const email = (u.email || '').trim().toLowerCase();
-    users[uid] = QBT_SHAWN_MAP[email] || `${first} ${last}`.trim();
+  // User list cached in KV (changes rarely — only on hire/fire)
+  // Refreshed once per day, or on first run
+  let users = {};
+  const cachedUsers = await env.KV.get('qbt_users');
+  if (cachedUsers) {
+    const parsed = JSON.parse(cachedUsers);
+    const age = Date.now() - (parsed._ts || 0);
+    if (age < 24 * 3600000) { // less than 24 hours old
+      users = parsed.users;
+    }
+  }
+  if (!Object.keys(users).length) {
+    const rawUsers = await qbtGet('users', { active: 'yes' }, qbtToken);
+    for (const [uid, u] of Object.entries(rawUsers)) {
+      const first = (u.first_name || '').trim();
+      const last = (u.last_name || '').trim();
+      const email = (u.email || '').trim().toLowerCase();
+      users[uid] = QBT_SHAWN_MAP[email] || `${first} ${last}`.trim();
+    }
+    await env.KV.put('qbt_users', JSON.stringify({ users, _ts: Date.now() }));
   }
 
   // Current week Mon-Sun in Eastern Time
@@ -524,8 +536,15 @@ async function refreshDashboard(env) {
   await env.KV.put('dashboard_json', JSON.stringify(dashboard));
   await env.KV.put('last_refresh', new Date().toISOString());
 
-  // Also refresh crew hours (non-blocking, don't fail dashboard if QBT fails)
-  try { await refreshCrewHours(env); } catch (e) { console.error('Crew refresh failed:', e.message); }
+  // Refresh crew hours every 60 min (non-blocking, don't fail dashboard if QBT fails)
+  try {
+    const lastCrew = await env.KV.get('crew_last_refresh');
+    const crewAge = lastCrew ? Date.now() - new Date(lastCrew).getTime() : Infinity;
+    if (crewAge >= 60 * 60 * 1000) {
+      await refreshCrewHours(env);
+      await env.KV.put('crew_last_refresh', new Date().toISOString());
+    }
+  } catch (e) { console.error('Crew refresh failed:', e.message); }
 
   return dashboard;
 }
@@ -556,10 +575,12 @@ export default {
       });
     }
 
-    // POST /api/refresh — trigger immediate refresh
+    // POST /api/refresh — trigger immediate refresh (bypasses 60-min crew throttle)
     if (url.pathname === '/api/refresh' && request.method === 'POST') {
       try {
         const dashboard = await refreshDashboard(env);
+        // Force crew refresh on manual request
+        try { await refreshCrewHours(env); await env.KV.put('crew_last_refresh', new Date().toISOString()); } catch(e) { console.error('Crew:', e.message); }
         return new Response(JSON.stringify({
           ok: true,
           bbls: dashboard.yesterday.bbls,
