@@ -679,8 +679,10 @@ def build_cadiz_section(cadiz_data, carrier_actuals):
     for note in maint_notes[:3]:
         maint_html += f'<div class="kv"><span class="lbl">Maintenance</span><span class="val" style="color:#90caf9;">{note[:150]}</span></div>\n'
 
-    # Carrier table
-    all_carriers = ['Badlands', 'KAG', 'Prop Logistics', 'BD Oil', '1st Choice Energy']
+    # Carrier table — known carriers first, then any new ones from actuals
+    known_carriers = ['Badlands', 'KAG', 'Prop Logistics', 'BD Oil', '1st Choice Energy']
+    extra_carriers = [c for c in carrier_actuals if c not in known_carriers]
+    all_carriers = known_carriers + sorted(extra_carriers)
     total_proj = 0
     total_actual_trucks = 0
     total_actual_bbls = 0
@@ -866,6 +868,20 @@ def build_crew_hours_html(rows, week_label):
             f'<td{ot_style}>{r["ot"]:.1f}</td></tr>\n'
         )
 
+    day_rows = [r for r in rows if r["shift"] == "Day"]
+    night_rows = [r for r in rows if r["shift"] == "Night"]
+    day_avg = sum(r["total"] for r in day_rows) / len(day_rows) if day_rows else 0
+    night_avg = sum(r["total"] for r in night_rows) / len(night_rows) if night_rows else 0
+
+    ot_note = ""
+    if len(night_rows) < 8 and night_avg > day_avg:
+        ot_note = (
+            f'<div class="flag" style="margin-top:8px;">Night shift ({len(night_rows)}) averaging '
+            f'{night_avg:.1f} hrs vs Day ({len(day_rows)}) at {day_avg:.1f} hrs. '
+            f'Target schedule is 5-on/3-off (8 per shift). Night running short-handed '
+            f'— OT normalizes once night reaches 8.</div>'
+        )
+
     return f"""<div class="section">
   <div class="sec-head">Crew Hours WTD - {week_label}</div>
   <table>
@@ -873,6 +889,7 @@ def build_crew_hours_html(rows, week_label):
     {table_rows}
     <tr class="tot"><td>TOTALS ({len(rows)})</td><td></td><td>{total_hrs:.1f}</td><td>{sum(r['reg'] for r in rows):.1f}</td><td>{total_ot:.1f}</td></tr>
   </table>
+  {ot_note}
   <div style="color:#555;font-size:10px;margin-top:6px;">Source: QuickBooks Time API (includes active shifts)</div>
 </div>"""
 
