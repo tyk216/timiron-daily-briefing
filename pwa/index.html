@@ -143,13 +143,16 @@
   <!-- Flags -->
   <div class="section" id="sec-flags"></div>
 
+  <!-- Crew Hours WTD -->
+  <div class="section" id="sec-crew"></div>
+
   <div class="foot" id="foot"></div>
 </div>
 
 <script>
-const DATA_URL = 'data/dashboard.json';
-const REFRESH_WORKER_URL = ''; // Set after Cloudflare Worker is deployed
-const REFRESH_INTERVAL = 30 * 60 * 1000; // 30 min
+const WORKER_URL = 'https://cadiz-ops-worker.timiron-ops.workers.dev';
+const DATA_URL = WORKER_URL + '/api/dashboard';
+const REFRESH_INTERVAL = 5 * 60 * 1000; // Check for new data every 5 min
 let lastData = null;
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -213,8 +216,8 @@ function render(d) {
   const ageMin = (Date.now() - new Date(d.generated_at).getTime()) / 60000;
   const freshClass = ageMin > 60 ? 'stale' : 'fresh';
   document.getElementById('h-sub').innerHTML =
-    `Based on ${shortDate(y.date)} data &middot; Updated <span class="${freshClass}">${age}</span>` +
-    (d.source_last_modified ? ` &middot; Log saved ${timeAgo(d.source_last_modified)}` : '');
+    `Data pulled <span class="${freshClass}">${age}</span>` +
+    (d.source_last_modified ? ` &middot; Loader last saved ${timeAgo(d.source_last_modified)}` : '');
 
   // Yesterday
   document.getElementById('sec-yesterday').innerHTML = `
@@ -366,12 +369,52 @@ function render(d) {
   if (!flagsHtml) flagsHtml = '<div class="flag grn">No flags — operations normal.</div>';
   document.getElementById('sec-flags').innerHTML = `<div class="sec-head">Flags</div>${flagsHtml}`;
 
+  // Crew Hours WTD (fetched separately)
+  loadCrewData();
+
   // Footer
   document.getElementById('foot').innerHTML = `${d.company} · ${d.terminal} · Auto-updated every 30 min<br>Source: ${d.source_file || 'Load Log'}`;
 
   // Show app, hide loader
   document.getElementById('app').style.display = '';
   document.getElementById('loader').classList.add('hidden');
+}
+
+// ── Crew Hours ─────────────────────────────────────────────────
+async function loadCrewData() {
+  try {
+    const r = await fetch(WORKER_URL + '/api/crew?t=' + Date.now());
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const c = await r.json();
+    if (c.error || !c.rows) throw new Error(c.error || 'No data');
+
+    let tableRows = '';
+    for (const row of c.rows) {
+      const nameDisplay = row.role ? `${row.name} (${row.role})` : row.name;
+      const otStyle = row.ot > 25 ? ' style="color:#ef5350;font-weight:bold"'
+                    : row.ot > 0 ? ' style="color:#FFD100"' : '';
+      const flag = row.total > 60 ? ' <span class="neg">!!</span>' : '';
+      tableRows += `<tr><td>${nameDisplay}</td><td>${row.shift}</td><td>${fmt(row.total,1)}${flag}</td><td>${fmt(row.reg,1)}</td><td${otStyle}>${fmt(row.ot,1)}</td></tr>`;
+    }
+
+    let otNote = '';
+    if (c.night_count < 8 && c.night_avg > c.day_avg) {
+      otNote = `<div class="flag" style="margin-top:6px;">Night (${c.night_count}) avg ${fmt(c.night_avg,1)} hrs vs Day (${c.day_count}) at ${fmt(c.day_avg,1)} hrs. Target: 5-on/3-off (8 per shift). Night short-handed — OT normalizes at 8.</div>`;
+    }
+
+    document.getElementById('sec-crew').innerHTML = `
+      <div class="sec-head">Crew Hours WTD — ${c.week_label}</div>
+      <table>
+        <tr><th>Name</th><th>Shift</th><th>Total</th><th>Reg</th><th>OT</th></tr>
+        ${tableRows}
+        <tr class="tot"><td>TOTALS (${c.rows.length})</td><td></td><td>${fmt(c.total_hrs,1)}</td><td>${fmt(c.total_hrs - c.total_ot,1)}</td><td>${fmt(c.total_ot,1)}</td></tr>
+      </table>
+      ${otNote}
+      <div style="color:#555;font-size:9px;margin-top:5px;">Source: QuickBooks Time API (includes active shifts)</div>`;
+  } catch(e) {
+    console.warn('Crew data unavailable:', e);
+    document.getElementById('sec-crew').innerHTML = '';
+  }
 }
 
 // ── Data Fetch ──────────────────────────────────────────────────
@@ -399,14 +442,17 @@ async function refreshData() {
   btn.classList.add('loading');
   btn.disabled = true;
 
-  // Trigger worker if configured (for future Cloudflare Worker)
-  if (REFRESH_WORKER_URL) {
-    try { await fetch(REFRESH_WORKER_URL, {mode:'no-cors'}); } catch(e) {}
-    btn.textContent = 'Waiting...';
-    await new Promise(r => setTimeout(r, 90000));
+  // Trigger Worker to pull fresh data from OneDrive
+  try {
+    btn.textContent = 'Pulling data...';
+    const refreshResp = await fetch(WORKER_URL + '/api/refresh', {method: 'POST'});
+    const refreshData = await refreshResp.json();
+    if (!refreshData.ok) throw new Error(refreshData.error || 'Refresh failed');
+  } catch(e) {
+    console.warn('Worker refresh failed, using cached:', e);
   }
 
-  // Refetch dashboard.json with cache busting
+  // Fetch updated dashboard JSON
   try {
     const r = await fetch(DATA_URL + '?t=' + Date.now(), {cache: 'no-store'});
     if (!r.ok) throw new Error('HTTP ' + r.status);
