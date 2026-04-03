@@ -523,6 +523,22 @@ async function refreshCrewHours(env) {
 
   const totalHrs = round(rows.reduce((s, r) => s + r.total, 0), 1);
 
+  // Monthly efficiency history (QBT hours from actual data, BBLs from dashboard)
+  // Pre-computed from historical data to avoid extra API calls each refresh
+  const monthlyEfficiency = [
+    { month: 'Sep 25', hrs: 1333, bbls: 241480, hc: 12 },
+    { month: 'Oct 25', hrs: 2715, bbls: 220569, hc: 12 },
+    { month: 'Nov 25', hrs: 2227, bbls: 176502, hc: 12 },
+    { month: 'Dec 25', hrs: 2300, bbls: 195816, hc: 12 },
+    { month: 'Jan 26', hrs: 2752, bbls: 308000, hc: 12 },
+    { month: 'Feb 26', hrs: 3313, bbls: 313600, hc: 13 },
+    { month: 'Mar 26', hrs: 3701, bbls: 319681, hc: 15 },
+  ].map(m => ({
+    ...m,
+    bbls_per_hr: round(m.bbls / m.hrs, 1),
+    labor_per_bbl: round(m.hrs * 20 / m.bbls, 2),
+  }));
+
   // Pull WTD BBLs from dashboard data (same week as crew hours) for efficiency metric
   let bbls_per_labor_hr = null;
   let wtd_bbls = null;
@@ -558,6 +574,7 @@ async function refreshCrewHours(env) {
     night_avg: nightRows.length ? round(nightRows.reduce((s,r) => s+r.total, 0) / nightRows.length, 1) : 0,
     bbls_per_labor_hr,
     wtd_bbls,
+    monthly_efficiency: monthlyEfficiency,
     generated_at: new Date().toISOString(),
   };
 
