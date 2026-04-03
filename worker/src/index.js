@@ -400,8 +400,12 @@ async function qbtGet(endpoint, params, qbtToken) {
     const r = await fetch(`${QBT_API}/${endpoint}?${p}`, {
       headers: { 'Authorization': `Bearer ${qbtToken}` },
     });
-    if (!r.ok) throw new Error(`QBT ${endpoint}: ${r.status}`);
-    const data = await r.json();
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      throw new Error(`QBT ${endpoint}: HTTP ${r.status} - ${body.slice(0, 200)}`);
+    }
+    let data;
+    try { data = await r.json(); } catch { throw new Error(`QBT ${endpoint}: invalid JSON response`); }
     const results = (data.results || {})[endpoint] || {};
     if (!Object.keys(results).length) break;
     Object.assign(all, results);
@@ -425,22 +429,37 @@ async function refreshCrewHours(env) {
     users[uid] = QBT_SHAWN_MAP[email] || `${first} ${last}`.trim();
   }
 
-  // Current week Mon-Sun (ET)
+  // Current week Mon-Sun in Eastern Time
+  // Determine ET offset dynamically (EDT=-4, EST=-5) using US DST rules:
+  // DST starts 2nd Sunday of March, ends 1st Sunday of November
   const nowMs = Date.now();
-  const etOff = -4 * 60 * 60 * 1000; // EDT offset
-  const nowET = new Date(nowMs + etOff);
-  const todayET = new Date(nowET.getFullYear(), nowET.getMonth(), nowET.getDate());
-  const dayOfWeek = todayET.getDay() || 7; // Sun=7
-  const monday = new Date(todayET.getTime() - (dayOfWeek - 1) * 86400000);
-  const sunday = new Date(monday.getTime() + 6 * 86400000);
-  const yesterday = new Date(monday.getTime() - 86400000);
+  const nowUTC = new Date(nowMs);
+  const year = nowUTC.getUTCFullYear();
+  const mar1 = new Date(Date.UTC(year, 2, 1));
+  const dstStart = new Date(Date.UTC(year, 2, 14 - mar1.getUTCDay(), 7)); // 2nd Sun Mar, 2AM EST = 7AM UTC
+  const nov1 = new Date(Date.UTC(year, 10, 1));
+  const dstEnd = new Date(Date.UTC(year, 10, 7 - nov1.getUTCDay(), 6));   // 1st Sun Nov, 2AM EDT = 6AM UTC
+  const isDST = nowMs >= dstStart.getTime() && nowMs < dstEnd.getTime();
+  const etOffHours = isDST ? -4 : -5;
+  const etOff = etOffHours * 3600000;
+
+  // Calculate today in ET as a YYYY-MM-DD string (avoid Date constructor timezone issues)
+  const etMs = nowMs + etOff;
+  const todayStr = new Date(etMs).toISOString().split('T')[0]; // safe: offset already applied
+  const todayParts = todayStr.split('-').map(Number);
+  // Day of week: 0=Sun..6=Sat -> convert to Mon=1..Sun=7
+  const tmpDate = new Date(Date.UTC(todayParts[0], todayParts[1]-1, todayParts[2]));
+  const dow = tmpDate.getUTCDay() || 7;
+  const mondayDate = new Date(Date.UTC(todayParts[0], todayParts[1]-1, todayParts[2] - (dow - 1)));
+  const sundayDate = new Date(mondayDate.getTime() + 6 * 86400000);
+  const yesterdayDate = new Date(mondayDate.getTime() - 86400000);
 
   const fmtD = d => d.toISOString().split('T')[0];
 
   // Fetch completed + active timesheets
-  const completed = await qbtGet('timesheets', { start_date: fmtD(monday), end_date: fmtD(sunday) }, qbtToken);
-  const activeY = await qbtGet('timesheets', { on_the_clock: 'yes', start_date: fmtD(yesterday) }, qbtToken);
-  const activeT = await qbtGet('timesheets', { on_the_clock: 'yes', start_date: fmtD(monday) }, qbtToken);
+  const completed = await qbtGet('timesheets', { start_date: fmtD(mondayDate), end_date: fmtD(sundayDate) }, qbtToken);
+  const activeY = await qbtGet('timesheets', { on_the_clock: 'yes', start_date: fmtD(yesterdayDate) }, qbtToken);
+  const activeT = await qbtGet('timesheets', { on_the_clock: 'yes', start_date: fmtD(mondayDate) }, qbtToken);
   const all = { ...completed, ...activeY, ...activeT };
 
   // Aggregate
@@ -477,7 +496,7 @@ async function refreshCrewHours(env) {
 
   const crew = {
     rows,
-    week_label: `${months[monday.getMonth()]} ${monday.getDate()}-${months[todayET.getMonth()]} ${todayET.getDate()}`,
+    week_label: `${months[mondayDate.getUTCMonth()]} ${mondayDate.getUTCDate()}-${months[todayParts[1]-1]} ${todayParts[2]}`,
     total_hrs: round(rows.reduce((s, r) => s + r.total, 0), 1),
     total_ot: round(rows.reduce((s, r) => s + r.ot, 0), 1),
     day_count: dayRows.length,
