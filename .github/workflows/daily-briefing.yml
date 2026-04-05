@@ -1,9 +1,8 @@
 name: Timiron Daily Briefing
 
 on:
-  schedule:
-    # 6:00 AM ET = 10:00 UTC (EDT, Mar-Nov)
-    - cron: '0 10 * * *'
+  # Scheduled trigger DISABLED 2026-04-05 — migrated to VPS (systemd timer on Hetzner).
+  # Kept as manual fallback only. See /opt/briefing on 178.156.254.183.
   workflow_dispatch:
 
 jobs:
