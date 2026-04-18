@@ -82,6 +82,35 @@ def month_name(d):
 # AUTH
 # ════════════════════════════════════════════════════════════════════════════
 
+
+def _persist_refresh_token(new_rt, env_path="/opt/briefing/briefing.env"):
+    """Atomically rewrite MS_GRAPH_REFRESH_TOKEN line in briefing.env.
+
+    Azure rotates refresh tokens on each use (offline_access, single-tenant MSA).
+    If we don't persist the rotated token, the next run fails with AADSTS900144
+    / malformed JWT. Called from get_access_token() on every successful refresh.
+    """
+    import os
+    with open(env_path) as _f:
+        lines = _f.readlines()
+    out, found = [], False
+    for ln in lines:
+        if ln.startswith("MS_GRAPH_REFRESH_TOKEN="):
+            out.append("MS_GRAPH_REFRESH_TOKEN=" + new_rt + "\n")
+            found = True
+        else:
+            out.append(ln)
+    if not found:
+        out.append("MS_GRAPH_REFRESH_TOKEN=" + new_rt + "\n")
+    tmp = env_path + ".tmp"
+    with open(tmp, "w") as _f:
+        _f.write("".join(out))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, env_path)
+    # Update in-memory constant so the rest of this run sees the new value
+    globals()["MS_GRAPH_REFRESH_TOKEN"] = new_rt
+
+
 def get_access_token():
     global ACCESS_TOKEN
     for attempt in range(3):
@@ -97,8 +126,12 @@ def get_access_token():
                 ACCESS_TOKEN = data["access_token"]
                 new_rt = data.get("refresh_token")
                 if new_rt and new_rt != MS_GRAPH_REFRESH_TOKEN:
-                    print("  ⚠ New refresh token issued. Update MS_GRAPH_REFRESH_TOKEN secret.")
-                    print(f"  New token (first 20 chars): {new_rt[:20]}...")
+                    try:
+                        _persist_refresh_token(new_rt)
+                        print("  ✓ Rotated refresh token persisted to briefing.env")
+                    except Exception as _pe:
+                        print(f"  ⚠ Rotated refresh token received but PERSIST FAILED: {_pe}")
+                        print(f"  Manual update needed (first 20 chars): {new_rt[:20]}...")
                 print("  Access token acquired.")
                 return True
             print(f"  Token refresh attempt {attempt+1} failed: {r.status_code} {r.text[:200]}")
@@ -416,12 +449,17 @@ def parse_load_log(excel_bytes, yesterday):
     carrier_actuals = {}
     if 'Carrier' in df.columns:
         yday_no_split = yday[~yday['Split Load'].apply(is_split2)]
-        for carrier_name, grp in yday_no_split.groupby('Carrier'):
-            normalized = carrier_name_map.get(carrier_name, carrier_name)
-            carrier_actuals[normalized] = {
-                'trucks': len(grp),
-                'bbls': round(yday[yday['Carrier'] == carrier_name]['Metered'].sum(), 1),
-            }
+        # Guard: empty yday (no loads yet for target date) drops columns in some
+        # pandas versions and raises KeyError on groupby. Skip gracefully.
+        if not yday_no_split.empty and 'Carrier' in yday_no_split.columns:
+            for carrier_name, grp in yday_no_split.groupby('Carrier'):
+                normalized = carrier_name_map.get(carrier_name, carrier_name)
+                carrier_actuals[normalized] = {
+                    'trucks': len(grp),
+                    'bbls': round(yday[yday['Carrier'] == carrier_name]['Metered'].sum(), 1),
+                }
+        else:
+            print(f'  Carrier actuals: skipped (yday rows={len(yday)}, yday_no_split rows={len(yday_no_split)}) — likely load log not yet updated for target date')
 
     # API Gravity and BSW
     avg_api = 0
@@ -546,23 +584,27 @@ def update_dashboard(template_path, d, output_path, crew_hours=None):
     net_per_head = round(d['ebitda'] / headcount) if headcount else 0
     ws.cell(r, 15).value = net_per_head                                                      # C15: Net/Head
 
-    # Pump Runtime
+    # Pump Runtime — C180 fix 2026-04-13:
+    # Use calendar-hours avail (days × 24) for Down Hrs, Total Hrs, and Util% so
+    # Run + Down = Total Hrs column for partial AND full months. Historical rows
+    # (Feb 2026 etc.) already use full-month calendar hours (28×24=672); this
+    # write matches that convention. Partial-month rows (April 2026†) show
+    # days_actual×24 = MTD calendar hours, clearly signalled by the † suffix.
     pr = wb['Pump Runtime']
     pr_row = find_month_row(pr, d['month_abbr'], 15)
-    hrs_month = d['days_in_month'] * 24
-    avail = d['days_actual'] * PUMP_AVAIL_HRS
+    calendar_avail = d['days_actual'] * 24   # per-pump MTD calendar hours
 
     pr.cell(pr_row, 1).value = f"{d['month_name']}{suffix}"
-    pr.cell(pr_row, 2).value = hrs_month
-    pr.cell(pr_row, 3).value = d['p101_hrs']
-    pr.cell(pr_row, 4).value = round(avail - d['p101_hrs'], 2)
-    pr.cell(pr_row, 5).value = round(d['p101_hrs'] / avail, 3) if avail > 0 else 0
-    pr.cell(pr_row, 6).value = d['p102_hrs']
-    pr.cell(pr_row, 7).value = round(avail - d['p102_hrs'], 2)
-    pr.cell(pr_row, 8).value = round(d['p102_hrs'] / avail, 3) if avail > 0 else 0
-    pr.cell(pr_row, 9).value = d['p103_hrs']
-    pr.cell(pr_row, 10).value = round(avail - d['p103_hrs'], 2)
-    pr.cell(pr_row, 11).value = round(d['p103_hrs'] / avail, 3) if avail > 0 else 0
+    pr.cell(pr_row, 2).value = calendar_avail  # MTD calendar hrs (was full-month; caused Run+Down≠Total on partials)
+    pr.cell(pr_row, 3).value = round(d['p101_hrs'], 2)
+    pr.cell(pr_row, 4).value = round(calendar_avail - d['p101_hrs'], 2)
+    pr.cell(pr_row, 5).value = round(d['p101_hrs'] / calendar_avail, 3) if calendar_avail > 0 else 0
+    pr.cell(pr_row, 6).value = round(d['p102_hrs'], 2)
+    pr.cell(pr_row, 7).value = round(calendar_avail - d['p102_hrs'], 2)
+    pr.cell(pr_row, 8).value = round(d['p102_hrs'] / calendar_avail, 3) if calendar_avail > 0 else 0
+    pr.cell(pr_row, 9).value = round(d['p103_hrs'], 2)
+    pr.cell(pr_row, 10).value = round(calendar_avail - d['p103_hrs'], 2)
+    pr.cell(pr_row, 11).value = round(d['p103_hrs'] / calendar_avail, 3) if calendar_avail > 0 else 0
     partial = f"Partial month thru {dt}" if d['days_remain'] > 0 else "Full month actuals"
     pr.cell(pr_row, 12).value = f"All 3 pumps active \u00b7 {partial}"
 
@@ -593,6 +635,92 @@ def update_dashboard(template_path, d, output_path, crew_hours=None):
         monday = today_et - timedelta(days=today_et.weekday())
         hr.cell(row=9, column=4, value=f"WTD\n{fmt_date_short(monday)}-{fmt_date_short(today_et)}")
         hr.cell(row=27, column=1, value=f"WTD = Week to date through {fmt_date_short(today_et)} (includes active night shift). Avg based on 4 full weeks only.")
+
+    # === XLSX REVAMP 2026-04-13 — unify April forecast across all tabs ===
+    # Before: Ops Dashboard R16 (live) + Apr P&L Forecast B5 (static pre-month) +
+    # Apr Weekly R4-9 (static pre-month) — three different Aprils. Now: one truth.
+    stamp = f"Live update \u2014 {fmt_date_short(d['yesterday_date'])} data, {d['days_actual']}-day run rate"
+
+    # --- Apr 2026 P&L Forecast tab: overwrite Services revenue with live projection ---
+    pl_sheet_name = None
+    for candidate in (f"{d['month_abbr']} 2026 P&L Forecast", "Apr 2026 P&L Forecast"):
+        if candidate in wb.sheetnames:
+            pl_sheet_name = candidate
+            break
+    if pl_sheet_name:
+        pl = wb[pl_sheet_name]
+        safe_write(pl, 5, 2, round(d['proj_rev'], 2))
+        safe_write(pl, 2, 2, stamp)
+        for r in range(67, min(75, pl.max_row + 1)):
+            val = pl.cell(r, 1).value
+            if val and isinstance(val, str) and val.startswith("Apr 2026"):
+                safe_write(pl, r, 1, (
+                    f"Apr 2026 = Live projection based on {d['days_actual']} days of actuals "
+                    f"(run rate {d['avg_bbls']:,.0f} bbls/day \u2192 {d['proj_bbls']:,.0f} bbls projected total). "
+                    f"Revenue cell is live-updated daily; expense lines scaled from Mar 2026 baseline."
+                ))
+
+    # --- Apr 2026 Weekly tab: rewrite per-week rows with actual/forecast split ---
+    wk_sheet_name = None
+    for candidate in (f"{d['month_abbr']} 2026 Weekly", "Apr 2026 Weekly"):
+        if candidate in wb.sheetnames:
+            wk_sheet_name = candidate
+            break
+    if wk_sheet_name:
+        wk = wb[wk_sheet_name]
+        days_in_m = d['days_in_month']
+        boundaries = [(1, 7), (8, 14), (15, 21), (22, 28), (29, days_in_m)]
+        daily = d.get('daily_data', []) or []
+        by_day = {dd['date'].day: dd for dd in daily}
+        yday_dom = d['yesterday_date'].day
+        run_rate = d['avg_bbls']
+        avg_trucks_day = d.get('avg_trucks', 0)
+        rev_per_bbl_live = d['proj_rev'] / d['proj_bbls'] if d['proj_bbls'] else 0
+        cost_per_day = d['fixed_cost'] / days_in_m if days_in_m else 0
+
+        for i, (start, end) in enumerate(boundaries):
+            if start > days_in_m:
+                break
+            row = 4 + i
+            days_count = end - start + 1
+            actual_bbls = sum(by_day[doy]['bbls'] for doy in range(start, end + 1) if doy in by_day)
+            actual_trucks = sum(by_day[doy]['trucks'] for doy in range(start, end + 1) if doy in by_day)
+            actual_days = sum(1 for doy in range(start, end + 1) if doy in by_day)
+            forecast_days = max(0, days_count - actual_days)
+            forecast_bbls = forecast_days * run_rate
+            week_bbls = actual_bbls + forecast_bbls
+            week_rev = week_bbls * rev_per_bbl_live
+            week_exp = days_count * cost_per_day
+            if end <= yday_dom:
+                status = "COMPLETE"
+            elif start > yday_dom:
+                status = "FORECAST"
+            else:
+                status = f"IN PROGRESS ({actual_days}/{days_count})"
+            safe_write(wk, row, 1, f"Week {i + 1}")
+            safe_write(wk, row, 2, f"{d['month_abbr']} {start}\u2013{end}")
+            safe_write(wk, row, 3, days_count)
+            safe_write(wk, row, 4, round(week_bbls))
+            safe_write(wk, row, 5, round(week_rev, 2))
+            safe_write(wk, row, 6, round(week_exp, 2))
+            safe_write(wk, row, 7, round(week_rev - week_exp, 2))
+            safe_write(wk, row, 8, status)
+
+        weeks_written = sum(1 for (s, e) in boundaries if s <= days_in_m)
+        for extra_row in range(4 + weeks_written, 9):
+            for c in range(1, 9):
+                safe_write(wk, extra_row, c, None)
+
+        safe_write(wk, 9, 1, "TOTAL")
+        safe_write(wk, 9, 2, f"{d['month_abbr']} 1\u2013{days_in_m}")
+        safe_write(wk, 9, 3, days_in_m)
+        safe_write(wk, 9, 4, round(d['proj_bbls']))
+        last_data_row = 4 + weeks_written - 1
+        safe_write(wk, 9, 5, f"=SUM(E4:E{last_data_row})")
+        safe_write(wk, 9, 6, f"=SUM(F4:F{last_data_row})")
+        safe_write(wk, 9, 7, "=E9-F9")
+        if wk.max_row >= 11:
+            safe_write(wk, 11, 1, f"RUN RATE (LIVE): {run_rate:,.0f} bbls/day \u00b7 {stamp}")
 
     wb.save(output_path)
     print(f"  Dashboard saved: {os.path.basename(output_path)}")
@@ -642,6 +770,163 @@ def update_external_report(template_path, d, output_path):
 
     wb.save(output_path)
     print(f"  External report saved: {os.path.basename(output_path)}")
+
+# ════════════════════════════════════════════════════════════════════════════
+# ATLAS SIGNALS — system health pulse + Tier 1 narrative (2026-04-13 revamp)
+# ════════════════════════════════════════════════════════════════════════════
+
+ATLAS_INTEGRITY_PATH = "/opt/nyx/data/integrity_check_results.json"
+
+def fetch_atlas_pulse():
+    """Read the latest integrity check (/opt/nyx/data/integrity_check_results.json).
+    JSON schema: {timestamp, passed, failed, total, elapsed_seconds, checks: [{name, ok, detail}]}
+    Returns dict with per-service up/down status + integrity (X/Y) + cadiz uptime."""
+    pulse = {
+        "integrity_passed": None, "integrity_total": None,
+        "timestamp": None,
+        "nyx_bot": "?", "nyx_bridge": "?", "memory_api": "?",
+        "dashboard": "?", "training_portal": "?",
+        "cadiz_pc": "?", "cadiz_uptime_h": None,
+    }
+    try:
+        with open(ATLAS_INTEGRITY_PATH) as f:
+            data = json.load(f)
+        pulse["integrity_passed"] = data.get("passed")
+        pulse["integrity_total"] = data.get("total")
+        pulse["timestamp"] = (data.get("timestamp") or "")[:16]
+        for c in data.get("checks", []):
+            name = (c.get("name") or "").lower()
+            ok = bool(c.get("ok"))
+            detail = c.get("detail") or ""
+            ico = "up" if ok else "down"
+            if "nyx bot" in name:
+                pulse["nyx_bot"] = ico
+            elif "nyx bridge" in name:
+                pulse["nyx_bridge"] = ico
+            elif "memory api" in name:
+                pulse["memory_api"] = ico
+            elif "dashboard pwa" in name or "dashboard worker" in name:
+                pulse["dashboard"] = ico
+            elif "training portal" in name:
+                pulse["training_portal"] = ico
+            elif "cadiz pc" in name:
+                pulse["cadiz_pc"] = ico
+                m = re.search(r'uptime\s*([\d.]+)\s*h', detail, re.I)
+                if m:
+                    try:
+                        pulse["cadiz_uptime_h"] = float(m.group(1))
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f"  ATLAS pulse fetch failed: {e}")
+    return pulse
+
+
+def _fetch_market_context():
+    """Fetch current crude oil market headlines via Perplexity Sonar.
+    Returns compact string or empty on any failure. Cost: ~$0.005/call, fires once/day in briefing.
+    """
+    try:
+        import sys as _s; _s.path.insert(0, "/opt/nyx")
+        from nyx_tools import execute_tool
+        q = (
+            "In 2-3 sentences, what moved the crude oil market in the past 24 hours? "
+            "Focus on WTI/Brent price action, OPEC+ decisions, US inventory surprises, or "
+            "geopolitical events relevant to a US midstream crude terminal. No bullet lists."
+        )
+        result = execute_tool("perplexity_research", {"query": q, "mode": "quick"})
+        if not result or "error" in result.lower()[:20] or "not configured" in result.lower():
+            return ""
+        # Strip sources block — narrative prompt doesn't need inline URLs
+        if "\n\nSources:" in result:
+            result = result.split("\n\nSources:")[0]
+        return result.strip()[:800]
+    except Exception as _e:
+        print(f"  ATLAS narrative: market context fetch failed ({_e})")
+        return ""
+
+
+def _push_atlas_to_dashboard(narrative, pulse, hero_kpis, market_context=""):
+    """POST ATLAS data to Worker so VERA loader dashboard PWA can display it."""
+    try:
+        import urllib.request as _ur, json as _j, os as _os
+        url = _os.environ.get("ATLAS_INGEST_URL", "https://cadiz-ops-worker.timiron-ops.workers.dev/api/atlas/ingest")
+        token = _os.environ.get("ATLAS_INGEST_TOKEN", "")
+        if not token:
+            print("  ATLAS dashboard push: no ATLAS_INGEST_TOKEN, skipping")
+            return
+        payload = _j.dumps({
+            "narrative": narrative or "",
+            "pulse": pulse or None,
+            "hero_kpis": hero_kpis or None,
+            "market_context": market_context or "",
+        }).encode()
+        req = _ur.Request(url, data=payload, headers={
+            "Content-Type": "application/json",
+            "X-Atlas-Token": token,
+            "User-Agent": "Timiron-Briefing/1.0",
+        })
+        r = _ur.urlopen(req, timeout=15)
+        print(f"  ATLAS dashboard push: {r.status}")
+    except Exception as _e:
+        print(f"  ATLAS dashboard push failed: {_e}")
+
+def generate_atlas_narrative(d, pu, yday_bbls, yday_trucks, combined_ute_pct):
+    """Use Tier 1 (Max subscription via claude -p) to generate 2-3 sentence plain-English
+    summary of yesterday's performance vs benchmarks. Zero cost. Returns empty on failure."""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, "/opt/nyx")
+        from claude_max import query_max, MaxSubFailedError
+    except Exception as e:
+        print(f"  ATLAS narrative: import failed ({e})")
+        return ""
+
+    # Build compact facts block — include day-of-week explicitly so LLM doesn't guess
+    mtd_vs_feb = (d['avg_bbls'] - FEB_2026_AVG) / FEB_2026_AVG * 100 if FEB_2026_AVG else 0
+    yday_dt = d['yesterday_date']
+    yday_label = yday_dt.strftime("%A, %B %d, %Y")  # "Sunday, April 12, 2026"
+    facts = (
+        f"Yesterday was {yday_label}.\n"
+        f"- Volume: {yday_bbls:,.0f} BBLs across {yday_trucks} trucks\n"
+        f"- Pump utilization (combined): {combined_ute_pct:.1f}% of 21-hr daily window\n"
+        f"- Per-pump ute: P-101 {pu['P-101']['ute']}%  P-102 {pu['P-102']['ute']}%  P-103 {pu['P-103']['ute']}%\n"
+        f"\nMonth-to-date ({d['days_actual']} days of {d['days_in_month']}):\n"
+        f"- MTD BBLs: {d['total_bbls']:,.0f}\n"
+        f"- Run rate: {d['avg_bbls']:,.0f} bbls/day ({mtd_vs_feb:+.1f}% vs Feb benchmark 11,200)\n"
+        f"- Projected month-end: {d['proj_bbls']:,.0f} BBLs / {d['proj_trucks']:,.0f} trucks\n"
+        f"- Rail capacity used: {d['rail_cap']*100:.1f}%\n"
+    )
+    # --- perplexity market context injection ---
+    market_ctx = _fetch_market_context()
+    market_block = f"\n\nCurrent crude market context (external):\n{market_ctx}\n" if market_ctx else ""
+    if market_ctx:
+        print(f"  Market context fetched ({len(market_ctx)} chars)")
+    prompt = (
+        "Write a 2-3 sentence plain-English briefing summary for Tyler, Director of Operations at Timiron "
+        "Midstream Partners' Cadiz crude terminal. Tone: direct, operational, no filler. Lead with the most "
+        "important fact from yesterday. If anything is notably above or below benchmark, call it out. "
+        "If the market context below contains anything materially relevant to our ops (price swing, OPEC move, "
+        "inventory surprise), weave one brief mention in. Avoid bullet lists — flowing sentences only. "
+        "Do NOT repeat raw numbers the reader can see in the tables below; synthesize meaning.\n\nData:\n"
+        + facts + market_block
+    )
+    try:
+        sys_prompt = "You are Timiron's operations analyst. Terse, senior-level. No fluff."
+        resp = query_max(
+            user_text=prompt,
+            system_prompt=sys_prompt,
+            history=None,
+            timeout=60,
+        )
+        return (resp or "").strip()
+    except MaxSubFailedError as e:
+        print(f"  ATLAS narrative: Tier 1 failed ({e}) -- skipping")
+        return ""
+    except Exception as e:
+        print(f"  ATLAS narrative: error ({e}) -- skipping")
+        return ""
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # BUILD EMAIL HTML
@@ -894,7 +1179,195 @@ def build_crew_hours_html(rows, week_label):
   <div style="color:#555;font-size:10px;margin-top:6px;">Source: QuickBooks Time API (includes active shifts)</div>
 </div>"""
 
-def build_email_html(d, dash_name, ext_name, cadiz_section="", crew_section=""):
+# ════════════════════════════════════════════════════════════════════════════
+# HERA — Commercial Intelligence Section
+# ════════════════════════════════════════════════════════════════════════════
+
+def build_hera_section():
+    """Fetch HERA commercial intel and render as HTML section for the briefing.
+    Returns empty string if HERA API is unreachable (graceful degradation)."""
+    import requests as _hera_requests
+    HERA_BASE = "http://127.0.0.1:5697"
+    try:
+        # Fetch last hunt stats
+        hunt_resp = _hera_requests.get(f"{HERA_BASE}/hunt/last", timeout=5)
+        hunt_resp.raise_for_status()
+        hunt_data = hunt_resp.json()
+        hunt = hunt_data.get("last_hunt", hunt_data)  # unwrap envelope
+        hunt_ts = hunt.get("ts", hunt.get("timestamp", "unknown"))
+        hunt_scanned = hunt.get("items_scanned", 0)
+        hunt_matched = hunt.get("items_matched", 0)
+
+        # Fetch new opportunities
+        opps_resp = _hera_requests.get(
+            f"{HERA_BASE}/opportunities",
+            params={"status": "new", "limit": "10"},
+            timeout=5,
+        )
+        opps_resp.raise_for_status()
+        opps_data = opps_resp.json()
+        opps = opps_data.get("opportunities", opps_data) if isinstance(opps_data, dict) else opps_data
+
+        # Sort by urgency: HIGH > MEDIUM > LOW
+        urgency_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+        opps = sorted(opps, key=lambda o: urgency_order.get(o.get("urgency", "LOW").upper(), 3))
+
+        # Build opportunity rows
+        if opps:
+            opp_rows = ""
+            for o in opps:
+                urg = o.get("urgency", "LOW").upper()
+                urg_color = {"HIGH": "#ef5350", "MEDIUM": "#ffb74d", "LOW": "#4caf50"}.get(urg, "#888")
+                otype = o.get("opportunity_type", "General")
+                liner = o.get("one_liner", "No description")
+                action = o.get("suggested_action", "Review")
+                opp_rows += (
+                    f'<div style="margin-bottom:10px;padding:8px;background:#1a1a1a;border-radius:4px;">'
+                    f'<div><span style="color:{urg_color};font-weight:bold;">[{urg}]</span> '
+                    f'<span style="color:#90caf9;">{otype}</span>: {liner}</div>'
+                    f'<div style="color:#888;font-size:11px;margin-top:3px;">Action: {action}</div>'
+                    f'</div>'
+                )
+            opp_html = opp_rows
+            count_label = f"{len(opps)} new opportunit{'y' if len(opps) == 1 else 'ies'}"
+        else:
+            opp_html = '<div style="color:#888;font-style:italic;">No new commercial opportunities since last briefing.</div>'
+            count_label = "0 new"
+
+        return (
+            '<div style="margin:24px 0;padding:14px;background:#0d1117;border:1px solid #30363d;'
+            'border-radius:8px;font-family:Segoe UI,Arial,sans-serif;color:#c9d1d9;">'
+            '<div style="color:#58a6ff;font-weight:bold;font-size:14px;margin-bottom:8px;">'
+            'HERA &mdash; Commercial Intelligence</div>'
+            f'<div style="color:#888;font-size:11px;margin-bottom:12px;">'
+            f'Last hunt: {hunt_ts} | {hunt_scanned} scanned | {hunt_matched} matches | {count_label}</div>'
+            f'{opp_html}'
+            '</div>'
+        )
+    except Exception as e:
+        print(f"  HERA section skipped (API unreachable): {e}")
+        return ""
+
+
+def build_rail_section():
+    """Fetch W&LE rail pipeline data and render as HTML section.
+    Returns empty string if HERA API is unreachable (graceful degradation)."""
+    import requests as _rail_requests
+    HERA_BASE = "http://127.0.0.1:5697"
+    try:
+        resp = _rail_requests.get(f"{HERA_BASE}/rail/summary", timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Cars by status
+        status_counts = data.get("by_status", data.get("cars_by_status", {}))
+        status_colors = {"enroute": "#42a5f5", "yard": "#ffb74d", "industry": "#66bb6a"}
+        status_pills = ""
+        for st in ["enroute", "yard", "industry"]:
+            cnt = status_counts.get(st, 0)
+            color = status_colors.get(st, "#888")
+            status_pills += (
+                f'<span style="display:inline-block;margin-right:12px;padding:4px 10px;'
+                f'background:{color}22;border:1px solid {color};border-radius:4px;'
+                f'color:{color};font-weight:bold;font-size:13px;">'
+                f'{st.upper()}: {cnt}</span>'
+            )
+
+        # Pipeline positions
+        pipeline = data.get("pipeline", data.get("positions", {}))
+        stops = ["BREWSTER", "SHANNONRN", "MINGOJCT", "NELMS"]
+        pipe_html = '<div style="margin-top:10px;display:flex;align-items:center;gap:0;">'
+        for i, stop in enumerate(stops):
+            cnt = pipeline.get(stop, pipeline.get(stop.lower(), 0))
+            pipe_html += (
+                f'<div style="text-align:center;padding:6px 12px;background:#1a1a1a;'
+                f'border-radius:4px;min-width:80px;">'
+                f'<div style="color:#90caf9;font-size:11px;">{stop}</div>'
+                f'<div style="color:#fff;font-weight:bold;font-size:16px;">{cnt}</div>'
+                f'</div>'
+            )
+            if i < len(stops) - 1:
+                pipe_html += '<div style="color:#555;font-size:16px;padding:0 4px;">&rarr;</div>'
+        pipe_html += "</div>"
+
+        report_date = data.get("report_date", data.get("date", "unknown"))
+
+        return (
+            '<div style="margin:24px 0;padding:14px;background:#0d1117;border:1px solid #30363d;'
+            'border-radius:8px;font-family:Segoe UI,Arial,sans-serif;color:#c9d1d9;">'
+            '<div style="color:#58a6ff;font-weight:bold;font-size:14px;margin-bottom:8px;">'
+            'Rail Pipeline &mdash; W&amp;LE Tracer</div>'
+            f'<div style="color:#888;font-size:11px;margin-bottom:10px;">Report date: {report_date}</div>'
+            f'<div style="margin-bottom:10px;">{status_pills}</div>'
+            f'{pipe_html}'
+            '</div>'
+        )
+    except Exception as e:
+        print(f"  Rail Pipeline section skipped (API unreachable): {e}")
+        return ""
+
+
+def build_invoice_section():
+    """Fetch invoice/spend summary and render as HTML section.
+    Returns empty string if HERA API is unreachable (graceful degradation)."""
+    import requests as _inv_requests
+    HERA_BASE = "http://127.0.0.1:5697"
+    try:
+        resp = _inv_requests.get(f"{HERA_BASE}/invoices/summary", timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+
+        total_invoices = data.get("total_invoices", data.get("count", 0))
+        total_spend = data.get("total_spend", data.get("total_extracted_spend", 0))
+        date_range = data.get("date_range", data.get("range", "unknown"))
+        if isinstance(date_range, dict):
+            date_range = f"{date_range.get('start', '?')} to {date_range.get('end', '?')}"
+        top_vendors = data.get("top_vendors", data.get("vendors_by_spend", []))[:5]
+
+        # Format spend
+        if isinstance(total_spend, (int, float)):
+            spend_fmt = f"${total_spend:,.2f}"
+        else:
+            spend_fmt = str(total_spend)
+
+        vendor_rows = ""
+        for v in top_vendors:
+            vname = v.get("vendor", v.get("name", "Unknown"))
+            vamt = v.get("spend", v.get("amount", v.get("total", 0)))
+            if isinstance(vamt, (int, float)):
+                vamt_fmt = f"${vamt:,.2f}"
+            else:
+                vamt_fmt = str(vamt)
+            vendor_rows += (
+                f'<div style="display:flex;justify-content:space-between;padding:5px 8px;'
+                f'background:#1a1a1a;border-radius:4px;margin-bottom:4px;">'
+                f'<span style="color:#c9d1d9;">{vname}</span>'
+                f'<span style="color:#66bb6a;font-weight:bold;">{vamt_fmt}</span>'
+                f'</div>'
+            )
+
+        if not vendor_rows:
+            vendor_rows = '<div style="color:#888;font-style:italic;">No vendor data available.</div>'
+
+        return (
+            '<div style="margin:24px 0;padding:14px;background:#0d1117;border:1px solid #30363d;'
+            'border-radius:8px;font-family:Segoe UI,Arial,sans-serif;color:#c9d1d9;">'
+            '<div style="color:#58a6ff;font-weight:bold;font-size:14px;margin-bottom:8px;">'
+            "Financial Intelligence &mdash; Kelly's Invoices</div>"
+            f'<div style="color:#888;font-size:11px;margin-bottom:10px;">'
+            f'{total_invoices} invoices | {spend_fmt} total spend | {date_range}</div>'
+            f'<div style="font-size:12px;color:#888;margin-bottom:6px;font-weight:bold;">Top 5 Vendors by Spend</div>'
+            f'{vendor_rows}'
+            '</div>'
+        )
+    except Exception as e:
+        print(f"  Invoice section skipped (API unreachable): {e}")
+        return ""
+
+
+def build_email_html(d, dash_name, ext_name, cadiz_section="", crew_section="", atlas_pulse=None, atlas_narrative=""):
+    """Revamped 2026-04-13 — hero KPI cards, ATLAS signals (pulse + narrative), sparkline.
+    Keeps all existing data; reshapes top of email for mobile-first, glance-able digest."""
     pu = d['pump_ute']
     dt_str = fmt_date(d['yesterday_date'])
     today_str = datetime.now().strftime('%A, %B %d, %Y')  # cross-platform
@@ -910,11 +1383,20 @@ def build_email_html(d, dash_name, ext_name, cadiz_section="", crew_section=""):
     vs_run = (yday_bbls - d['avg_bbls']) / d['avg_bbls'] * 100 if d['avg_bbls'] > 0 else 0
     vs_feb = d['proj_bbls'] - FEB_2026_TOTAL
     mtd_vs = (d['avg_bbls'] - FEB_2026_AVG) / FEB_2026_AVG * 100
+    yday_rev = rev_per_day(yday_bbls)
 
     avg_api = d.get('avg_api_gravity', 0)
     avg_bsw = d.get('avg_bsw', 0)
     mabbr = d['month_abbr']
     month_label = d['month_name']
+
+    def arrow(val):
+        """Trend arrow with color for a % delta."""
+        if val >= 1:
+            return f'<span style="color:#4caf50">&#9650; {val:+.1f}%</span>'
+        if val <= -1:
+            return f'<span style="color:#ef5350">&#9660; {val:+.1f}%</span>'
+        return f'<span style="color:#888">&#9632; {val:+.1f}%</span>'
 
     def badge(val):
         c = '#4caf50' if val >= 0 else '#ef5350'
@@ -923,6 +1405,15 @@ def build_email_html(d, dash_name, ext_name, cadiz_section="", crew_section=""):
     def badge_abs(val):
         c = '#4caf50' if val >= 0 else '#ef5350'
         return f'<span style="color:{c}">{val:+,.0f} BBLs</span>'
+
+    def hero_card(label, value, sub=""):
+        return (
+            '<td style="width:25%;padding:8px;text-align:center;vertical-align:top;">'
+            f'<div style="color:#888;font-size:10px;text-transform:uppercase;letter-spacing:1px;">{label}</div>'
+            f'<div style="color:#fff;font-size:22px;font-weight:bold;margin:4px 0;">{value}</div>'
+            f'<div style="color:#777;font-size:10px;">{sub}</div>'
+            '</td>'
+        )
 
     # 5-Day Trend
     daily_data = d.get('daily_data', [])
@@ -979,13 +1470,90 @@ def build_email_html(d, dash_name, ext_name, cadiz_section="", crew_section=""):
 
     forecast_label = f"{month_label} Forecast ({d['days_actual']}-Day Rate)" if d['days_remain'] > 0 else f"{month_label} Final ({d['days_actual']}-Day Actuals)"
 
+    # === ATLAS pulse strip ===
+    ap = atlas_pulse or {}
+    def pulse_dot(status):
+        if status == "up":
+            return '<span style="color:#4caf50;font-weight:bold;">&#9679;</span>'
+        if status == "down":
+            return '<span style="color:#ef5350;font-weight:bold;">&#9679;</span>'
+        return '<span style="color:#666;">&#9679;</span>'
+    ap_nyx = pulse_dot(ap.get("nyx_bot", "?"))
+    ap_br = pulse_dot(ap.get("nyx_bridge", "?"))
+    ap_mem = pulse_dot(ap.get("memory_api", "?"))
+    ap_dash = pulse_dot(ap.get("dashboard", "?"))
+    ap_train = pulse_dot(ap.get("training_portal", "?"))
+    ap_cadiz = pulse_dot(ap.get("cadiz_pc", "?"))
+    ap_cadiz_up = f'{ap.get("cadiz_uptime_h", 0):.0f}h' if ap.get("cadiz_uptime_h") else "?"
+    ap_int_p = ap.get("integrity_passed")
+    ap_int_t = ap.get("integrity_total")
+    if ap_int_p is not None and ap_int_t:
+        ap_int_txt = f"{ap_int_p}/{ap_int_t}"
+        ap_int_col = "#4caf50" if ap_int_p == ap_int_t else "#ef5350"
+    else:
+        ap_int_txt = "?"
+        ap_int_col = "#666"
+    ap_time = ap.get("timestamp") or ""
+
+    narrative_html = ""
+    if atlas_narrative:
+        narrative_html = (
+            '<div class="narr">'
+            f'<div class="narr-label">ATLAS BRIEFING</div>'
+            f'<div class="narr-body">{atlas_narrative}</div>'
+            '</div>'
+        )
+
+    pulse_html = (
+        '<div class="pulse">'
+        f'<span class="pulse-label">ATLAS PULSE</span> &nbsp; '
+        f'{ap_nyx} NYX &nbsp; {ap_br} Bridge &nbsp; {ap_mem} Mem &nbsp; '
+        f'{ap_dash} Dash &nbsp; {ap_train} Train &nbsp; {ap_cadiz} Cadiz PC ({ap_cadiz_up}) &nbsp; '
+        f'<span style="color:{ap_int_col};">Integrity {ap_int_txt}</span>'
+        f' &nbsp;<span class="pulse-time">{ap_time}</span>'
+        '</div>'
+    )
+
+    # Hero 4-card grid — BBLs, Trucks, Util%, Est Revenue
+    hero_html = (
+        '<table class="hero" width="100%" cellspacing="0" cellpadding="0"><tr>'
+        + hero_card("Yesterday BBLs", f"{yday_bbls:,.0f}", f"{arrow(vs_run)} vs run rate")
+        + hero_card("Trucks", f"{yday_trucks}", f"{bbl_per_truck:.0f} BBL / truck")
+        + hero_card("Pump Util", f"{combined_ute:.0f}%", f"{yday_rt:.1f} run-hrs")
+        + hero_card("Est Revenue", f"${yday_rev/1000:,.1f}k", f"{bbl_hr_comb:.0f} BBL / hr")
+        + '</tr></table>'
+    )
+
+    # Pre-compose flags block (moved up in layout)
+    flags_block = (
+        '<div class="section">'
+        '<div class="sec-head">Flags &amp; Attention</div>'
+        f'{flags_html}'
+        '<div class="flag grn">&#128206; Both Excel files attached (internal + external report).</div>'
+        '</div>'
+    ) if flags_html else (
+        '<div class="section">'
+        '<div class="sec-head">Flags &amp; Attention</div>'
+        '<div class="flag grn">No operational flags raised. &#128206; Both Excel files attached.</div>'
+        '</div>'
+    )
+
     return f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8">
 <style>
   body{{background:#1a1a1a;font-family:'Courier New',monospace;color:#e0e0e0;margin:0;padding:20px;}}
-  .wrap{{max-width:640px;margin:0 auto;}}
-  .title{{color:#fff;font-size:15px;font-weight:bold;border-bottom:1px solid #444;padding-bottom:8px;margin-bottom:6px;}}
-  .sub{{color:#666;font-size:11px;margin-bottom:18px;}}
+  .wrap{{max-width:680px;margin:0 auto;}}
+  .title{{color:#fff;font-size:16px;font-weight:bold;border-bottom:1px solid #444;padding-bottom:8px;margin-bottom:6px;}}
+  .sub{{color:#666;font-size:11px;margin-bottom:14px;}}
+  .narr{{background:#1e2a1e;border-left:3px solid #4caf50;padding:10px 14px;margin-bottom:12px;border-radius:2px;}}
+  .narr-label{{color:#4caf50;font-size:9px;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:4px;font-weight:bold;}}
+  .narr-body{{color:#e0e0e0;font-size:13px;line-height:1.55;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;}}
+  .pulse{{background:#1f1f1f;border:1px solid #333;padding:8px 12px;margin-bottom:12px;border-radius:2px;font-size:11px;color:#ccc;}}
+  .pulse-label{{color:#777;font-weight:bold;letter-spacing:1px;}}
+  .pulse-time{{color:#555;font-size:9px;}}
+  table.hero{{border-collapse:collapse;margin-bottom:12px;background:#242424;border:1px solid #333;border-radius:3px;}}
+  table.hero td{{border-right:1px solid #2e2e2e;}}
+  table.hero tr td:last-child{{border-right:none;}}
   .section{{background:#242424;border:1px solid #333;border-radius:3px;padding:13px 15px;margin-bottom:12px;}}
   .sec-head{{color:#999;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:9px;border-bottom:1px solid #2e2e2e;padding-bottom:5px;}}
   .kv{{display:flex;justify-content:space-between;padding:3px 0;font-size:13px;border-bottom:1px solid #2a2a2a;}}
@@ -1002,22 +1570,20 @@ def build_email_html(d, dash_name, ext_name, cadiz_section="", crew_section=""):
 </style>
 </head><body><div class="wrap">
 <div class="title">\U0001f4ca Timiron Daily Briefing &nbsp;|&nbsp; Cadiz Terminal</div>
-<div class="sub">{today_str} &nbsp;\u00b7&nbsp; Based on {dt_str} LOGS</div>
+<div class="sub">{today_str} &nbsp;\u00b7&nbsp; Reporting {dt_str}</div>
 
-<div class="section">
-  <div class="sec-head">Yesterday \u2014 {dt_str}</div>
-  <div class="kv"><span class="lbl">BBLs</span><span class="val">{yday_bbls:,.0f}</span></div>
-  <div class="kv"><span class="lbl">Trucks</span><span class="val">{yday_trucks}</span></div>
-  <div class="kv"><span class="lbl">Avg BBLs / Truck</span><span class="val">{bbl_per_truck:.1f}</span></div>
-  <div class="kv"><span class="lbl">Avg API Gravity</span><span class="val">{avg_api:.2f}</span></div>
-  <div class="kv"><span class="lbl">Avg BSW</span><span class="val">{avg_bsw:.3f}</span></div>
-  <div class="kv"><span class="lbl">vs Run Rate</span><span class="val">{badge(vs_run)} ({yday_bbls:,.0f} vs {d['avg_bbls']:,.0f})</span></div>
-</div>
+{narrative_html}
+
+{hero_html}
+
+{pulse_html}
+
+{flags_block}
 
 {cadiz_section}
 
 <div class="section">
-  <div class="sec-head">Pump Utilization \u2014 {dt_str}</div>
+  <div class="sec-head">Pump Detail \u2014 Yesterday ({dt_str})</div>
   <table>
     <tr><th>Pump</th><th>Loads</th><th>Splits</th><th>Hrs</th><th>Ute%</th><th>BBLs</th><th>BBL/Hr</th></tr>
     <tr><td>P-101</td><td>{pu['P-101']['loads']}</td><td>{pu['P-101']['splits']}</td><td>{pu['P-101']['runtime']}</td><td>{pu['P-101']['ute']}%</td><td>{pu['P-101']['bbls']:,.0f}</td><td>{pu['P-101']['bbl_hr']:.0f}</td></tr>
@@ -1025,7 +1591,13 @@ def build_email_html(d, dash_name, ext_name, cadiz_section="", crew_section=""):
     <tr><td>P-103</td><td>{pu['P-103']['loads']}</td><td>{pu['P-103']['splits']}</td><td>{pu['P-103']['runtime']}</td><td>{pu['P-103']['ute']}%</td><td>{pu['P-103']['bbls']:,.0f}</td><td>{pu['P-103']['bbl_hr']:.0f}</td></tr>
     <tr class="tot"><td>Combined</td><td>{yday_trucks}</td><td>{yday_splits}</td><td>{yday_rt:.2f}</td><td>{combined_ute:.1f}%</td><td>{yday_bbls:,.0f}</td><td>{bbl_hr_comb:.0f}</td></tr>
   </table>
-  <div style="color:#555;font-size:10px;margin-top:6px;">Ute% = runtime / 21 avail hrs (24hr - 3hr rail switch)</div>
+  <div style="color:#555;font-size:10px;margin-top:6px;">Yesterday per-pump Ute% = runtime / 21 daily-avail hrs (24hr minus 3hr rail switch). MTD pump-util in the xlsx uses calendar-hours to stay comparable to prior months.</div>
+</div>
+
+<div class="section">
+  <div class="sec-head">Crude Quality \u2014 Yesterday</div>
+  <div class="kv"><span class="lbl">Avg API Gravity</span><span class="val">{avg_api:.2f}</span></div>
+  <div class="kv"><span class="lbl">Avg BSW</span><span class="val">{avg_bsw:.3f}</span></div>
 </div>
 
 <div class="section">
@@ -1042,7 +1614,7 @@ def build_email_html(d, dash_name, ext_name, cadiz_section="", crew_section=""):
   <div class="kv"><span class="lbl">MTD Actuals</span><span class="val">{d['total_bbls']:,.0f} BBLs</span></div>
   <div class="kv"><span class="lbl">Daily Avg ({d['days_actual']} days)</span><span class="val">{d['avg_bbls']:,.1f} bbls/day</span></div>
   <div class="kv"><span class="lbl">vs Feb (11,200/day)</span><span class="val">{badge(mtd_vs)}</span></div>
-  <div class="kv"><span class="lbl">Rail Cap</span><span class="val" style="color:#90caf9">{d['rail_cap']*100:.1f}%</span></div>
+  <div class="kv"><span class="lbl">Rail Cap Used</span><span class="val" style="color:#90caf9">{d['rail_cap']*100:.1f}%</span></div>
   <div class="kv"><span class="lbl">Days Remaining</span><span class="val">{d['days_remain']}</span></div>
 </div>
 
@@ -1062,17 +1634,11 @@ def build_email_html(d, dash_name, ext_name, cadiz_section="", crew_section=""):
   <div class="kv"><span class="lbl">vs Feb (313,600 BBLs)</span><span class="val">{badge_abs(vs_feb)}</span></div>
 </div>
 
-<div class="section">
-  <div class="sec-head">Flags</div>
-  {flags_html}
-  <div class="flag grn">\U0001f4ce Both Excel files attached.</div>
-</div>
-
 {crew_section}
 
 </div>
 <div class="foot">
-  Timiron Midstream Partners \u00b7 Cadiz Terminal, OH \u00b7 Auto-generated<br>
+  Timiron Midstream Partners \u00b7 Cadiz Terminal, OH \u00b7 ATLAS briefing\u2014v5<br>
   {dash_name} \u00b7 {ext_name}
 </div>
 </div></body></html>"""
@@ -1096,7 +1662,8 @@ def send_via_gmail(subject, html_body, attachment_paths):
         part.add_header('Content-Disposition', 'attachment', filename=os.path.basename(path))
         msg.attach(part)
 
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=30) as server:
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+        server.starttls()
         server.login(GMAIL_ADDRESS, GMAIL_APP_PASS)
         server.sendmail(GMAIL_ADDRESS, RECIPIENTS, msg.as_string())
 
@@ -1111,7 +1678,8 @@ def send_error_email(error_msg):
         msg['Subject'] = f"\u26a0 Timiron Briefing FAILED | {date.today().strftime('%b %d')}"
         body = f"The daily briefing pipeline failed.\n\n{error_msg}\n\nCheck GitHub Actions for details."
         msg.attach(MIMEText(body, 'plain'))
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=30) as server:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+            server.starttls()
             server.login(GMAIL_ADDRESS, GMAIL_APP_PASS)
             server.sendmail(GMAIL_ADDRESS, [RECIPIENTS[0]], msg.as_string())
         print("  Error notification sent.")
@@ -1188,8 +1756,94 @@ def main():
         crew_section = build_crew_hours_html(crew_hours, crew_week_label) if crew_hours else ""
         dash_name = os.path.basename(dash_out)
         ext_name = os.path.basename(ext_out)
+
+        # ATLAS signals (revamp 2026-04-13)
+        print("  [6a] Fetching ATLAS pulse...")
+        atlas_pulse = fetch_atlas_pulse()
+        print(f"  Pulse: integrity={atlas_pulse.get('integrity_passed')}/{atlas_pulse.get('integrity_total')} nyx={atlas_pulse.get('nyx_bot')} bridge={atlas_pulse.get('nyx_bridge')} cadiz={atlas_pulse.get('cadiz_pc')}")
+
+        print("  [6b] Generating ATLAS narrative (Tier 1)...")
+        pu_for_narr = d['pump_ute']
+        yday_bbls_narr = sum(v['bbls'] for v in pu_for_narr.values())
+        yday_trucks_narr = sum(v['loads'] for v in pu_for_narr.values())
+        yday_rt_narr = sum(v['runtime'] for v in pu_for_narr.values())
+        combined_ute_narr = yday_rt_narr / (PUMP_AVAIL_HRS * 3) * 100 if yday_rt_narr > 0 else 0
+        atlas_narrative = generate_atlas_narrative(d, pu_for_narr, yday_bbls_narr, yday_trucks_narr, combined_ute_narr)
+        if atlas_narrative:
+            print(f"  Narrative ({len(atlas_narrative)} chars): {atlas_narrative[:120]}...")
+        else:
+            print("  Narrative: empty (skipped)")
+
+        # --- atlas dashboard push ---
+        print("  [6c] Pushing ATLAS data to loader dashboard (VERA)...")
+        _hero = {
+            "yday_bbls": yday_bbls_narr,
+            "yday_trucks": yday_trucks_narr,
+            "combined_ute_pct": round(combined_ute_narr, 1),
+            "mtd_bbls": d["total_bbls"],
+            "avg_bbls": d["avg_bbls"],
+            "proj_bbls": d["proj_bbls"],
+            "proj_trucks": d["proj_trucks"],
+            "rail_cap_pct": round(d["rail_cap"] * 100, 1),
+        }
+        _mkt = _fetch_market_context() if "_fetch_market_context" in globals() else ""
+        _push_atlas_to_dashboard(atlas_narrative, atlas_pulse, _hero, _mkt)
+
         subject = f"\U0001f4ca Timiron Daily Briefing | {today.strftime('%A, %B %d, %Y')}"
-        html_body = build_email_html(d, dash_name, ext_name, cadiz_section, crew_section)
+        html_body = build_email_html(d, dash_name, ext_name, cadiz_section, crew_section, atlas_pulse, atlas_narrative)
+        # NYXP_STATUS_INJECT (C238 follow-up, 2026-04-14 overnight) — append NYXp daily health
+        try:
+            import sys as _nyxp_sys
+            if "/opt/nyx" not in _nyxp_sys.path:
+                _nyxp_sys.path.insert(0, "/opt/nyx")
+            from nyxp_status import render as _nyxp_render
+            _nyxp_text = _nyxp_render()
+            _nyxp_section = (
+                '<div style="margin:24px 0;padding:14px;background:#0d1117;border:1px solid #30363d;border-radius:8px;font-family:Consolas,monospace;color:#c9d1d9;">' +
+                '<div style="color:#58a6ff;font-weight:bold;margin-bottom:8px;">NYXp — Tier Routing &amp; Spend (last 24h)</div>' +
+                '<pre style="margin:0;white-space:pre-wrap;font-size:12px;line-height:1.5;">' +
+                _nyxp_text.replace('<', '&lt;').replace('>', '&gt;') +
+                '</pre></div>'
+            )
+            if "</body>" in html_body:
+                html_body = html_body.replace("</body>", _nyxp_section + "</body>", 1)
+            else:
+                html_body = html_body + _nyxp_section
+        except Exception as _nyxp_e:
+            print(f"  NYXp section inject failed: {_nyxp_e}")
+        # HERA_COMMERCIAL_INJECT (C246, 2026-04-15) — append HERA commercial intel
+        try:
+            _hera_section = build_hera_section()
+            if _hera_section:
+                if "</body>" in html_body:
+                    html_body = html_body.replace("</body>", _hera_section + "</body>", 1)
+                else:
+                    html_body = html_body + _hera_section
+                print("  HERA section injected.")
+        except Exception as _hera_e:
+            print(f"  HERA section inject failed: {_hera_e}")
+        # RAIL_PIPELINE_INJECT — append rail pipeline status
+        try:
+            _rail_section = build_rail_section()
+            if _rail_section:
+                if "</body>" in html_body:
+                    html_body = html_body.replace("</body>", _rail_section + "</body>", 1)
+                else:
+                    html_body = html_body + _rail_section
+                print("  Rail Pipeline section injected.")
+        except Exception as _rail_e:
+            print(f"  Rail Pipeline section inject failed: {_rail_e}")
+        # INVOICE_SUMMARY_INJECT — append financial intelligence
+        try:
+            _invoice_section = build_invoice_section()
+            if _invoice_section:
+                if "</body>" in html_body:
+                    html_body = html_body.replace("</body>", _invoice_section + "</body>", 1)
+                else:
+                    html_body = html_body + _invoice_section
+                print("  Invoice section injected.")
+        except Exception as _inv_e:
+            print(f"  Invoice section inject failed: {_inv_e}")
         print(f"  HTML: {len(html_body):,} bytes")
 
         # Step 7: Send
