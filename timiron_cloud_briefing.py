@@ -1647,7 +1647,34 @@ def build_email_html(d, dash_name, ext_name, cadiz_section="", crew_section="", 
 # SEND EMAIL
 # ════════════════════════════════════════════════════════════════════════════
 
+def _persist_for_consolidator(subject, html_body, attachment_paths):
+    """Phase 1 consolidation: drop subject/html/attach manifest where
+    /opt/briefing/consolidated_send.py reads them at 06:05 ET."""
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        out_dir = _Path("/opt/briefing/logs")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "last_cadiz.html").write_text(html_body, encoding="utf-8")
+        (out_dir / "last_cadiz_subject.txt").write_text(subject, encoding="utf-8")
+        (out_dir / "last_cadiz_attach.json").write_text(
+            _json.dumps([str(p) for p in attachment_paths]), encoding="utf-8")
+        print(f"  Persisted Cadiz brief artifacts to {out_dir} for consolidator.")
+    except Exception as _e:
+        print(f"  WARN: persist for consolidator failed: {_e}")
+
+
 def send_via_gmail(subject, html_body, attachment_paths):
+    # Phase 1 consolidation: always drop artifacts so consolidated_send.py
+    # can pick them up at 06:05 ET. Honor --no-send to skip the actual send.
+    _persist_for_consolidator(subject, html_body, attachment_paths)
+    if globals().get("NO_SEND"):
+        print(f"  --no-send: skipping Cadiz direct email; consolidator will ship.")
+        return
+    return _send_via_gmail_real(subject, html_body, attachment_paths)
+
+
+def _send_via_gmail_real(subject, html_body, attachment_paths):
     msg = MIMEMultipart('mixed')
     msg['From'] = GMAIL_ADDRESS
     msg['To'] = ', '.join(RECIPIENTS)
@@ -1691,6 +1718,17 @@ def send_error_email(error_msg):
 # ════════════════════════════════════════════════════════════════════════════
 
 def main():
+    # Phase 1 consolidation: --no-send flag suppresses the per-script email
+    # so /opt/briefing/consolidated_send.py can ship one combined message.
+    import argparse as _argparse
+    _ap = _argparse.ArgumentParser(add_help=False)
+    _ap.add_argument("--no-send", action="store_true",
+                     help="Skip direct send; persist artifacts for consolidated_send.py")
+    _args, _ = _ap.parse_known_args()
+    globals()["NO_SEND"] = bool(_args.no_send)
+    if _args.no_send:
+        print("  [--no-send] direct Cadiz email suppressed; consolidator owns delivery.")
+
     today = date.today()
     yesterday = today - timedelta(days=1)
     date_str = fmt_date_file(today)

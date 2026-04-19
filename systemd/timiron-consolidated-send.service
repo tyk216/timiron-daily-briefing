@@ -1,0 +1,18 @@
+[Unit]
+Description=Timiron Consolidated Brief — single 06:05 ET email (HERA + Cadiz)
+After=timiron-briefing.service hera-daily-briefing.service network-online.target
+Wants=timiron-briefing.service hera-daily-briefing.service
+# NOTE: Wants (not Requires) so a failed source brief still lets the
+# consolidated send fire; it will ship a "[partial]" email with whichever
+# brief succeeded.
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/briefing
+EnvironmentFile=/opt/briefing/briefing.env
+ExecStart=/opt/briefing/venv/bin/python /opt/briefing/consolidated_send.py
+StandardOutput=append:/opt/briefing/logs/consolidated.log
+StandardError=append:/opt/briefing/logs/consolidated.log
+
+[Install]
+WantedBy=multi-user.target
