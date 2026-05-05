@@ -3423,94 +3423,198 @@ async function handleFlagmanHours(crewToken, env) {
 // ============================================================================
 // FLAGMAN Task 6 — PDF + OneDrive + Email export on inspection submit
 // ----------------------------------------------------------------------------
-// Hand-rolled minimal PDF generator (text-only, ASCII, 1 page, Helvetica).
-// Avoids bundling pdf-lib (~832 KiB) into the direct-PUT worker bundle.
-// Sufficient for v1: header, inspection metadata, notes, photo r2_keys list.
-// If photos-embedded layout is needed later, swap to wrangler-deploy + pdf-lib.
+// pdf-lib version (bundled via wrangler/esbuild). Embeds photos pulled from
+// R2 binding FLAGMAN_PHOTOS. ASCII-only Helvetica text, US Letter, multi-page.
 // ============================================================================
+import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+
 function asciiOnly(s) {
   if (s == null) return '';
   return String(s).replace(/[^\x09\x0A\x0D\x20-\x7E]/g, '');
 }
 
-function pdfEscape(s) {
-  return asciiOnly(s).replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)').replace(/[\r\n\t]/g, ' ');
+// Word-wrap an ASCII string to a max char width (rough — pdf-lib measures
+// pixel widths, but for monospaced-like Helvetica at 10pt, ~88 chars fits in
+// ~504pt of usable width).
+function wrapAscii(s, maxChars) {
+  const out = [];
+  const lines = asciiOnly(s).split(/\r?\n/);
+  for (const line of lines) {
+    if (line.length <= maxChars) { out.push(line); continue; }
+    const words = line.split(/\s+/);
+    let cur = '';
+    for (const w of words) {
+      if (!cur) { cur = w; continue; }
+      if (cur.length + 1 + w.length <= maxChars) cur += ' ' + w;
+      else { out.push(cur); cur = w; }
+    }
+    if (cur) out.push(cur);
+  }
+  return out;
 }
 
-function renderInspectionPDF(record) {
-  // US Letter @ 72 dpi: 612 x 792 points. Origin bottom-left.
-  const lines = [];
-  const push = (txt) => lines.push(asciiOnly(txt));
+// Detect image kind from first bytes. Returns 'jpg' | 'png' | null.
+function detectImageKind(bytes) {
+  if (!bytes || bytes.length < 8) return null;
+  // JPEG: FF D8 FF
+  if (bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) return 'jpg';
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) return 'png';
+  return null;
+}
 
-  push(`FLAGMAN Inspection Report`);
-  push(`Inspection ID: ${record.inspection_id || ''}`);
-  push(`Crew Token:    ${record.crew_token || ''}`);
-  push(`Type:          ${record.inspection_type || ''}`);
-  push(`Timestamp:     ${record.timestamp || ''}`);
-  push(`Received At:   ${record.received_at || ''}`);
-  if (record.location) push(`Location:      ${typeof record.location === 'string' ? record.location : JSON.stringify(record.location)}`);
-  if (record.gps) push(`GPS:           ${typeof record.gps === 'string' ? record.gps : JSON.stringify(record.gps)}`);
-  push('');
-  push(`Notes:`);
-  const noteLines = (record.notes || '').toString().split(/\r?\n/);
-  for (const nl of noteLines) {
-    let s = nl;
-    while (s.length > 88) {
-      push('  ' + s.slice(0, 88));
-      s = s.slice(88);
-    }
-    push('  ' + s);
+// Render the inspection as a multi-page PDF with embedded photos.
+// Async because we fetch photo bytes from R2 (env.FLAGMAN_PHOTOS).
+// Returns Uint8Array of PDF bytes.
+async function renderInspectionPDF(record, env) {
+  const pdfDoc = await PDFDocument.create();
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+  const pageW = 612, pageH = 792;
+  const marginL = 54, marginR = 54, marginTop = 750, marginBottom = 54;
+  const usableW = pageW - marginL - marginR;
+  const lineHeight = 13;
+
+  let page = pdfDoc.addPage([pageW, pageH]);
+  let y = marginTop;
+  const black = rgb(0, 0, 0);
+  const grey = rgb(0.4, 0.4, 0.4);
+
+  function newPage() {
+    page = pdfDoc.addPage([pageW, pageH]);
+    y = marginTop;
   }
-  push('');
+
+  function ensureRoom(needed) {
+    if (y - needed < marginBottom) newPage();
+  }
+
+  function drawLine(text, opts = {}) {
+    const f = opts.bold ? fontBold : font;
+    const size = opts.size || 10;
+    const color = opts.color || black;
+    ensureRoom(size + 2);
+    page.drawText(asciiOnly(text), { x: marginL, y: y - size, size, font: f, color });
+    y -= (size + 3);
+  }
+
+  function drawWrapped(text, opts = {}) {
+    const lines = wrapAscii(text, opts.maxChars || 88);
+    for (const ln of lines) drawLine(ln, opts);
+  }
+
+  function blank(h) { y -= (h || lineHeight); }
+
+  // Header
+  drawLine('FLAGMAN Inspection Report', { bold: true, size: 16 });
+  blank(4);
+  drawLine(`Inspection ID: ${record.inspection_id || ''}`);
+  drawLine(`Crew Token:    ${record.crew_token || ''}`);
+  drawLine(`Type:          ${record.inspection_type || ''}`);
+  drawLine(`Timestamp:     ${record.timestamp || ''}`);
+  drawLine(`Received At:   ${record.received_at || ''}`);
+  if (record.location) {
+    const loc = typeof record.location === 'string' ? record.location : JSON.stringify(record.location);
+    drawLine(`Location:      ${loc}`);
+  }
+  if (record.gps) {
+    const gps = typeof record.gps === 'string' ? record.gps : JSON.stringify(record.gps);
+    drawLine(`GPS:           ${gps}`);
+  }
+  blank();
+
+  // Checklist (if present in record)
+  const checklist = Array.isArray(record.checklist) ? record.checklist :
+                    (record.checklist && typeof record.checklist === 'object'
+                      ? Object.entries(record.checklist).map(([k, v]) => ({ item: k, state: v }))
+                      : []);
+  if (checklist.length) {
+    drawLine('Checklist:', { bold: true, size: 11 });
+    for (const c of checklist) {
+      const item = (c && (c.item || c.name || c.label)) || '';
+      const state = (c && (c.state || c.status || c.result || c.value)) || '';
+      const note = (c && (c.note || c.notes || c.comment)) || '';
+      const stateStr = String(state).toUpperCase();
+      drawWrapped(`  [${stateStr}] ${item}${note ? ' -- ' + note : ''}`, { maxChars: 88 });
+    }
+    blank();
+  }
+
+  // Notes
+  drawLine('Notes:', { bold: true, size: 11 });
+  drawWrapped(record.notes ? String(record.notes) : '(none)', { maxChars: 88 });
+  blank();
+
+  // Photos
   const photos = Array.isArray(record.photos) ? record.photos : [];
-  push(`Photos: ${photos.length}`);
-  const limit = Math.min(photos.length, 12);
-  for (let i = 0; i < limit; i++) {
+  drawLine(`Photos (${photos.length}):`, { bold: true, size: 11 });
+
+  // Embed up to 24 photos. Each rendered max 480w x 360h (preserves aspect).
+  const maxEmbed = Math.min(photos.length, 24);
+  const photoMaxW = 480, photoMaxH = 360;
+
+  for (let i = 0; i < maxEmbed; i++) {
     const p = photos[i];
     const key = (typeof p === 'string') ? p : (p && (p.r2_key || p.key)) || '';
-    push(`  [${i + 1}] ${key}`);
-  }
-  if (photos.length > 12) push(`  ... +${photos.length - 12} more`);
-  push('');
-  push(`Generated: ${new Date().toISOString()}`);
-  push(`Source:    cadiz-ops-worker (FLAGMAN Task 6)`);
-
-  // Helvetica 10pt, 12pt leading.
-  const pageW = 612, pageH = 792, marginL = 54, marginTop = 750, leading = 12;
-  let stream = `BT\n/F1 10 Tf\n${leading} TL\n${marginL} ${marginTop} Td\n`;
-  for (let i = 0; i < lines.length; i++) {
-    if (i === 0) {
-      stream += `(${pdfEscape(lines[i])}) Tj\n`;
-    } else {
-      stream += `T*\n(${pdfEscape(lines[i])}) Tj\n`;
+    if (!key) continue;
+    let bytes = null;
+    let imgErr = null;
+    try {
+      if (env && env.FLAGMAN_PHOTOS) {
+        const obj = await env.FLAGMAN_PHOTOS.get(key);
+        if (obj) bytes = new Uint8Array(await obj.arrayBuffer());
+        else imgErr = 'not-found';
+      } else {
+        imgErr = 'no-binding';
+      }
+    } catch (e) {
+      imgErr = 'fetch:' + (e.message || 'err');
     }
-  }
-  stream += `ET\n`;
 
-  const objs = [];
-  objs.push(`<< /Type /Catalog /Pages 2 0 R >>`);
-  objs.push(`<< /Type /Pages /Kids [3 0 R] /Count 1 >>`);
-  objs.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageW} ${pageH}] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>`);
-  objs.push(`<< /Length ${stream.length} >>\nstream\n${stream}endstream`);
-  objs.push(`<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>`);
+    // Caption (always rendered)
+    drawLine(`  [${i + 1}] ${key}`, { color: grey, size: 9 });
 
-  let pdf = `%PDF-1.4\n%\xE2\xE3\xCF\xD3\n`;
-  const offsets = [];
-  for (let i = 0; i < objs.length; i++) {
-    offsets.push(pdf.length);
-    pdf += `${i + 1} 0 obj\n${objs[i]}\nendobj\n`;
-  }
-  const xrefOffset = pdf.length;
-  pdf += `xref\n0 ${objs.length + 1}\n`;
-  pdf += `0000000000 65535 f \n`;
-  for (const off of offsets) {
-    pdf += `${String(off).padStart(10, '0')} 00000 n \n`;
-  }
-  pdf += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+    if (!bytes) {
+      drawLine(`      (image unavailable: ${imgErr || 'unknown'})`, { color: grey, size: 9 });
+      continue;
+    }
 
-  const out = new Uint8Array(pdf.length);
-  for (let i = 0; i < pdf.length; i++) out[i] = pdf.charCodeAt(i) & 0xff;
-  return out;
+    const kind = detectImageKind(bytes);
+    if (!kind) {
+      drawLine(`      (unsupported image format)`, { color: grey, size: 9 });
+      continue;
+    }
+
+    let img;
+    try {
+      img = (kind === 'jpg') ? await pdfDoc.embedJpg(bytes) : await pdfDoc.embedPng(bytes);
+    } catch (e) {
+      drawLine(`      (embed failed: ${asciiOnly(e.message || 'err')})`, { color: grey, size: 9 });
+      continue;
+    }
+
+    // Scale to fit photoMaxW x photoMaxH, preserve aspect
+    const scaleW = photoMaxW / img.width;
+    const scaleH = photoMaxH / img.height;
+    const scale = Math.min(scaleW, scaleH, 1);
+    const drawW = img.width * scale;
+    const drawH = img.height * scale;
+
+    ensureRoom(drawH + 8);
+    page.drawImage(img, { x: marginL, y: y - drawH, width: drawW, height: drawH });
+    y -= (drawH + 8);
+  }
+  if (photos.length > maxEmbed) {
+    drawLine(`  ... +${photos.length - maxEmbed} more (not embedded)`, { color: grey, size: 9 });
+  }
+
+  // Footer on last page
+  blank(8);
+  drawLine(`Generated: ${new Date().toISOString()}`, { color: grey, size: 8 });
+  drawLine(`Source:    cadiz-ops-worker (FLAGMAN Task 6, pdf-lib)`, { color: grey, size: 8 });
+
+  return await pdfDoc.save();
 }
 
 function uint8ToBase64(bytes) {
@@ -3567,7 +3671,7 @@ async function exportInspectionToOneDriveAndEmail(record, env) {
   // 2. Render + PUT PDF
   let pdfBytes;
   try {
-    pdfBytes = renderInspectionPDF(record);
+    pdfBytes = await renderInspectionPDF(record, env);
   } catch (e) {
     await env.KV.put(`flagman:export_error:${id}`, JSON.stringify({ stage: 'pdf_render', error: e.message }), { expirationTtl: 7 * 86400 });
     return { ok: false, error: `pdf_render: ${e.message}` };
