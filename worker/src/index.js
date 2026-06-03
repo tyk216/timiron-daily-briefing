@@ -2967,15 +2967,14 @@ async function handleFlagmanSubmit(payload, env) {
   if (!crewToken) {
     return { status: 'error', error: 'Missing crew_token' };
   }
-  const inspectionType = (payload.inspection_type || '').toString().trim();
-  if (!inspectionType) {
-    return { status: 'error', error: 'Missing inspection_type' };
-  }
+  // Back-compat: inspection_type falls back to checklist_id, then "daily"
+  const inspectionType = (payload.inspection_type || payload.checklist_id || 'daily').toString().trim();
 
   // Task 2: validate crew_token against training-portal crew API.
   // Cached in KV (flagman:token_valid:<token>) with 1hr TTL.
   const cacheKey = `flagman:token_valid:${crewToken}`;
   let tokenValid = await env.KV.get(cacheKey);
+  let crewName = null;
   if (tokenValid === null) {
     try {
       const resp = await fetch(`https://training.kolassus.ai/api/crew/${encodeURIComponent(crewToken)}`, {
@@ -2984,6 +2983,10 @@ async function handleFlagmanSubmit(payload, env) {
       if (resp.status === 200) {
         tokenValid = '1';
         await env.KV.put(cacheKey, '1', { expirationTtl: 3600 });
+        try {
+          const body = await resp.json();
+          crewName = body.name || body.crew_name || null;
+        } catch (_) {}
       } else if (resp.status === 404) {
         tokenValid = '0';
         await env.KV.put(cacheKey, '0', { expirationTtl: 3600 });
@@ -2999,35 +3002,78 @@ async function handleFlagmanSubmit(payload, env) {
     return { status: 'error', error: 'Invalid crew token' };
   }
 
+  // Idempotency: if submission_id present and already stored, return cached result
+  const submissionId = payload.submission_id ? payload.submission_id.toString().trim() : null;
+  if (submissionId) {
+    const dedupKey = `flagman:submitted:${submissionId}`;
+    const existing = await env.KV.get(dedupKey);
+    if (existing !== null) {
+      try {
+        const stored = JSON.parse(existing);
+        return { status: 'ok', inspection_id: stored.inspection_id };
+      } catch (_) {}
+    }
+  }
+
   const ts = (payload.timestamp || new Date().toISOString()).toString();
   const rand = Math.random().toString(36).slice(2, 6);
   const safeToken = crewToken.replace(/[^a-zA-Z0-9_-]/g, '_');
   const inspectionId = `${ts.replace(/[:.]/g, '-')}_${safeToken}_${rand}`;
 
-  const photos = Array.isArray(payload.photos) ? payload.photos : [];
+  // Build flat photos array (back-compat union): legacy top-level + items photo_keys + frame_keys
+  const legacyPhotos = Array.isArray(payload.photos) ? payload.photos : [];
+  const itemsPhotos = Array.isArray(payload.items)
+    ? payload.items.flatMap(item => Array.isArray(item.photo_keys) ? item.photo_keys : [])
+    : [];
+  const frameKeys = Array.isArray(payload.frame_keys) ? payload.frame_keys : [];
+  const photosUnion = [...new Set([...legacyPhotos, ...itemsPhotos, ...frameKeys])];
+
+  // Resolve crew_name — try KV cache if not resolved from token lookup
+  if (!crewName) {
+    crewName = await env.KV.get(`flagman:crew_name:${crewToken}`);
+  }
+
   const record = {
     inspection_id: inspectionId,
     crew_token: crewToken,
+    crew_name: crewName || null,
     inspection_type: inspectionType,
     notes: (payload.notes || '').toString(),
-    photos: photos,
+    photos: photosUnion,
     timestamp: ts,
     location: payload.location || null,
     gps: payload.gps || null,
     received_at: new Date().toISOString(),
+    // Rich fields (new, optional)
+    submission_id: submissionId || null,
+    asset: payload.asset || null,
+    checklist_id: payload.checklist_id || null,
+    direction: payload.direction || null,
+    railcar_number: payload.railcar_number || null,
+    items: Array.isArray(payload.items) ? payload.items : [],
+    frame_keys: frameKeys,
+    source: payload.source || null,
   };
 
   // Persist full record
   await env.KV.put(`flagman:inspection:${inspectionId}`, JSON.stringify(record));
 
-  // Prepend summary to recent-100 list
+  // Store dedup key for idempotency (30-day TTL)
+  if (submissionId) {
+    await env.KV.put(`flagman:submitted:${submissionId}`, JSON.stringify({ inspection_id: inspectionId }), { expirationTtl: 30 * 86400 });
+  }
+
+  // Prepend summary to recent-100 list (extended fields for PWA Recent tab + VERA)
   const summary = {
     inspection_id: inspectionId,
     crew_token: crewToken,
+    crew_name: crewName || null,
     inspection_type: inspectionType,
     timestamp: ts,
-    photo_count: photos.length,
+    photo_count: photosUnion.length,
     location: record.location,
+    asset: record.asset,
+    railcar_number: record.railcar_number,
   };
   let recent = [];
   try {
@@ -3771,3 +3817,6 @@ async function exportInspectionToOneDriveAndEmail(record, env) {
     sent_to: recipient,
   };
 }
+
+// Test-only export (tree-shaken in production build)
+export { handleFlagmanSubmit };
