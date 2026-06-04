@@ -2760,6 +2760,38 @@ export default {
       }
     }
 
+    // GET /api/flagman/pending-ocr?token=<adminToken>&limit=<N>
+    // Admin-gated. Returns inspections that have frame_keys but no ocr block yet.
+    if (url.pathname === '/api/flagman/pending-ocr' || url.pathname === '/api/flagman/pending-ocr/') {
+      const token = (url.searchParams.get('token') || '').trim();
+      const limitParam = url.searchParams.get('limit');
+      const limit = limitParam !== null ? Number(limitParam) : null;
+      const result = await handleFlagmanPendingOcr({ token, limit }, env);
+      return new Response(JSON.stringify(result.body), {
+        status: result.status,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    // POST /api/flagman/inspection/<id>/ocr?token=<adminToken>
+    // Admin-gated. Attaches/overwrites ocr block on a stored inspection record.
+    if (request.method === 'POST' && /^\/api\/flagman\/inspection\/[^/]+\/ocr\/?$/.test(url.pathname)) {
+      const parts = url.pathname.replace(/\/$/, '').split('/');
+      // path: ['', 'api', 'flagman', 'inspection', <id>, 'ocr']
+      const id = parts[4] || '';
+      const token = (url.searchParams.get('token') || '').trim();
+      let ocr = {};
+      try {
+        const body = await request.json();
+        ocr = (body && typeof body.ocr === 'object' && body.ocr !== null) ? body.ocr : {};
+      } catch (_) { /* treat missing/invalid body as empty ocr */ }
+      const result = await handleFlagmanOcrWriteback({ token, id, ocr }, env);
+      return new Response(JSON.stringify(result.body), {
+        status: result.status,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
     // GET /api/flagman/recent — list last 100 inspections (for VERA backfill / PWA history)
     if (url.pathname === '/api/flagman/recent' || url.pathname === '/api/flagman/recent/') {
       const recentRaw = await env.KV.get('flagman:inspections:recent');
@@ -3819,5 +3851,110 @@ async function exportInspectionToOneDriveAndEmail(record, env) {
   };
 }
 
+// ============================================================================
+// FLAGMAN OCR support handlers (Task: pending-ocr list + OCR writeback)
+// ----------------------------------------------------------------------------
+// handleFlagmanPendingOcr({ token, limit }, env)
+//   → { status, body }  where body = { count, pending: [{inspection_id, frame_keys}] }
+//
+// handleFlagmanOcrWriteback({ token, id, ocr }, env)
+//   → { status, body }  where body = { status:'ok', inspection_id } | { error }
+//
+// Admin gate: same pattern as /api/flagman/admin/* — ?token resolves to role=admin
+// via training-portal.  Returns status 403 on missing/bad token (mirrors existing).
+// ============================================================================
+
+async function _flagmanAdminAuth(token) {
+  if (!token) return false;
+  try {
+    const r = await fetch(`https://training.kolassus.ai/api/crew/${encodeURIComponent(token)}`, {
+      headers: { 'User-Agent': 'FLAGMAN/1.0' },
+    });
+    if (r.status === 200) {
+      const j = await r.json();
+      if (j && j.crew && j.crew.role === 'admin') return true;
+    }
+  } catch (_) { /* fall through */ }
+  return false;
+}
+
+async function handleFlagmanPendingOcr({ token, limit }, env) {
+  const adminOk = await _flagmanAdminAuth((token || '').trim());
+  if (!adminOk) {
+    return { status: 403, body: { error: 'forbidden' } };
+  }
+
+  const cap = (limit !== null && limit !== undefined && !isNaN(Number(limit)) && Number(limit) > 0)
+    ? Math.floor(Number(limit))
+    : 10;
+
+  let recent = [];
+  try {
+    const raw = await env.KV.get('flagman:inspections:recent');
+    if (raw) recent = JSON.parse(raw);
+    if (!Array.isArray(recent)) recent = [];
+  } catch (_) { recent = []; }
+
+  const pending = [];
+  for (const summary of recent) {
+    if (pending.length >= cap) break;
+    // Skip entries already marked as has_ocr in the summary (fast path)
+    if (summary.has_ocr) continue;
+    // Fetch full record to check frame_keys and ocr block
+    let record = null;
+    try {
+      const recRaw = await env.KV.get(`flagman:inspection:${summary.inspection_id}`);
+      if (!recRaw) continue;
+      record = JSON.parse(recRaw);
+    } catch (_) { continue; }
+    if (!Array.isArray(record.frame_keys) || record.frame_keys.length === 0) continue;
+    if (record.ocr) continue;
+    pending.push({ inspection_id: record.inspection_id, frame_keys: record.frame_keys });
+  }
+
+  return { status: 200, body: { count: pending.length, pending } };
+}
+
+async function handleFlagmanOcrWriteback({ token, id, ocr }, env) {
+  const adminOk = await _flagmanAdminAuth((token || '').trim());
+  if (!adminOk) {
+    return { status: 403, body: { error: 'forbidden' } };
+  }
+
+  const recKey = `flagman:inspection:${id}`;
+  let record = null;
+  try {
+    const raw = await env.KV.get(recKey);
+    if (!raw) return { status: 404, body: { error: 'not_found' } };
+    record = JSON.parse(raw);
+  } catch (_) {
+    return { status: 404, body: { error: 'not_found' } };
+  }
+
+  // Attach/overwrite ocr block; set _at if not provided
+  const ocrBlock = Object.assign({}, ocr);
+  if (!ocrBlock._at) ocrBlock._at = new Date().toISOString();
+  record.ocr = ocrBlock;
+
+  await env.KV.put(recKey, JSON.stringify(record));
+
+  // Reflect has_ocr in the recent summary list (additive, back-compat)
+  try {
+    const recentRaw = await env.KV.get('flagman:inspections:recent');
+    if (recentRaw) {
+      let recent = JSON.parse(recentRaw);
+      if (Array.isArray(recent)) {
+        let updated = false;
+        for (const s of recent) {
+          if (s.inspection_id === id) { s.has_ocr = true; updated = true; break; }
+        }
+        if (updated) await env.KV.put('flagman:inspections:recent', JSON.stringify(recent));
+      }
+    }
+  } catch (_) { /* non-fatal — writeback already committed */ }
+
+  return { status: 200, body: { status: 'ok', inspection_id: id } };
+}
+
 // Test-only export (tree-shaken in production build)
-export { handleFlagmanSubmit };
+export { handleFlagmanSubmit, handleFlagmanPendingOcr, handleFlagmanOcrWriteback };
