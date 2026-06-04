@@ -226,5 +226,24 @@ function makeEnv({ kvSeed = {}, trainingStatus = 200, trainingBody = { name: 'Te
 }
 
 // ---------------------------------------------------------------------------
+// Test 9: submission_id > 128 chars is truncated to 128 and does not throw
+// ---------------------------------------------------------------------------
+{
+  const env = makeEnv();
+  const longId = 'x'.repeat(600);
+  const payload = {
+    crew_token: 'tok-abc',
+    submission_id: longId,
+    notes: 'long id test',
+  };
+  const result = await handleFlagmanSubmit(payload, env);
+  assert(result.status === 'ok', 'T9: oversized submission_id does not throw');
+  // Dedup key must use the truncated (128-char) id, not the full 600-char one
+  const truncated = longId.slice(0, 128);
+  const dedupKey = `flagman:submitted:${truncated}`;
+  assert(env.KV._store.has(dedupKey), 'T9: dedup key uses truncated 128-char submission_id');
+}
+
+// ---------------------------------------------------------------------------
 console.log(`\n${pass} pass, ${fail} fail`);
 if (fail > 0) process.exit(1);

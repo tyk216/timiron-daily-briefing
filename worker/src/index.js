@@ -3003,7 +3003,8 @@ async function handleFlagmanSubmit(payload, env) {
   }
 
   // Idempotency: if submission_id present and already stored, return cached result
-  const submissionId = payload.submission_id ? payload.submission_id.toString().trim() : null;
+  let submissionId = payload.submission_id ? payload.submission_id.toString().trim() : null;
+  if (submissionId && submissionId.length > 128) submissionId = submissionId.slice(0, 128);
   if (submissionId) {
     const dedupKey = `flagman:submitted:${submissionId}`;
     const existing = await env.KV.get(dedupKey);
